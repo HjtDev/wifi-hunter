@@ -1,0 +1,41 @@
+[network]
+interface   = "wlan0"
+connection  = ""                       # nmcli connection name; empty = use the active wifi connection
+prefix      = 21
+gateway     = "172.18.47.254"
+ranges      = ["172.18.40.1-172.18.40.255", "172.18.41.1-172.18.41.255"]
+exclude     = ["172.18.47.254"]        # gateway etc.
+prefer_unused = true                   # try IPs not seen in ARP scan first (shared IPs still allowed)
+
+[dns]
+default       = ["172.18.32.1"]        # dorm DNS
+override      = ["8.8.8.8"] # used for the portal-bypass feature
+hunt_with_override = true              # test candidates with override DNS to avoid the portal page
+final_mode    = "auto"                 # default | override | auto (after hunt, see section 8)
+
+[tests]
+ping_target        = "1.1.1.1"
+ping_count         = 5
+connectivity_url   = "http://connectivitycheck.gstatic.com/generate_204"
+speed_url          = "https://speed.cloudflare.com/__down?bytes=5000000"
+sustained_seconds  = 8
+sample_interval    = 0.5
+data_budget_mb     = 9999999              # daily cap for test traffic
+
+[thresholds]
+max_ping_ms         = 200
+max_loss_pct        = 2
+min_speed_mbps      = 5
+min_sustained_mbps  = 4
+collapse_below_mbps = 1                # speed under this for >= 2 s counts as collapse
+
+[hunt]
+max_candidates   = 30
+order            = "random"            # random | sequential | best-history
+settle_seconds   = 4                   # wait after applying an IP
+
+[watchdog]
+interval_seconds     = 10
+probe_bytes          = 200000
+bad_checks_to_rehunt = 3
+notify               = true
