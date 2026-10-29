@@ -1,0 +1,5 @@
+[project]
+name = "wifi-hunter"
+version = "0.1.0"
+requires-python = ">=3.15"
+dependencies = []
