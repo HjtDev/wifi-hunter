@@ -43,11 +43,14 @@ class TestsCfg:
     speed_url: str = "https://speed.cloudflare.com/__down?bytes=5000000"
     sustained_seconds: int = 8
     sample_interval: float = 0.5
-    data_budget_mb: int = 6000
+    data_budget_mb: int = 6000  # 0 = unlimited
     sustained_url: str = ""  # optional: one long download; empty = repeat speed_url
     dns_domains: list[str] = field(
         default_factory=lambda: ["google.com", "cloudflare.com", "wikipedia.org"]
     )
+
+    def budget_bytes(self) -> float:
+        return self.data_budget_mb * 1_000_000 if self.data_budget_mb > 0 else float("inf")
 
 
 @dataclass
@@ -57,6 +60,8 @@ class ThresholdsCfg:
     min_speed_mbps: float = 5
     min_sustained_mbps: float = 4
     collapse_below_mbps: float = 1
+    # "both": quick AND sustained must reach their limits. "either": one of them is enough.
+    speed_rule: str = "both"
 
 
 @dataclass
@@ -76,6 +81,9 @@ class WatchdogCfg:
     min_probe_mbps: float = 1.0
     # After a failed re-hunt wait this long (doubling each time, max 30 min) before trying again.
     rehunt_cooldown_seconds: float = 300
+    # If the wifi interface itself carries more than this (Mbps) between two checks, a slow probe
+    # is blamed on your own traffic and ignored. 0 disables the rule.
+    busy_mbps: float = 2.0
 
 
 @dataclass
@@ -94,6 +102,11 @@ class PortalCfg:
     credentials_file: str = "~/.config/dorm-ip/credentials.toml"
     keyring_service: str = ""  # optional: read username/password from the system keyring
     login_during_hunt: bool = False  # log in on candidates that show the portal (see NOTES)
+    max_logins_per_hunt: int = 10  # stop logging in after this many successful logins in one hunt
+    # Resolve the portal host through the dorm DNS (dns.default) even while the system DNS is the
+    # override: the portal name usually only exists in the dorm DNS.
+    resolve_via_dorm_dns: bool = True
+    host_ip: str = ""  # optional fixed IP for the portal host (skips DNS)
     verify_tls: bool = True
     timeout: float = 10
 
@@ -188,6 +201,8 @@ def _validate(cfg: Config) -> None:
         _ip(ip, "dns")
     if cfg.dns.final_mode not in _VALID_FINAL:
         raise ConfigError(f"config: dns.final_mode must be one of {sorted(_VALID_FINAL)}")
+    if cfg.thresholds.speed_rule not in ("both", "either"):
+        raise ConfigError("config: thresholds.speed_rule must be 'both' or 'either'")
     if cfg.hunt.order not in _VALID_ORDER:
         raise ConfigError(f"config: hunt.order must be one of {sorted(_VALID_ORDER)}")
     if not n.ranges:
@@ -237,16 +252,20 @@ def finalize(cfg: Config) -> Config:
     return replace(cfg, ips=ips, warnings=warnings)
 
 
+def default_config_path() -> Path:
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "dorm-ip" / "config.toml"
+
+
 def find_config(explicit: Path | None = None) -> Path:
     if explicit is not None:
         if not explicit.is_file():
             raise ConfigError(f"config file not found: {explicit}")
         return explicit
-    xdg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    for p in (Path("config.toml"), xdg / "dorm-ip" / "config.toml"):
+    for p in (default_config_path(), Path("config.toml")):
         if p.is_file():
             return p
-    raise ConfigError("no config.toml found (looked in ./ and ~/.config/dorm-ip/); use --config PATH")
+    raise ConfigError("no config found: run `dorm-ip init` (looked in ~/.config/dorm-ip/ and ./); or use --config PATH")
 
 
 def load_config(path: Path | None = None) -> Config:

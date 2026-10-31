@@ -5,10 +5,7 @@ Order is cheap -> expensive and the suite fails fast to save the daily data quot
 
 from __future__ import annotations
 
-import random
 import re
-import socket
-import struct
 import subprocess
 import time
 from collections.abc import Callable
@@ -16,7 +13,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from . import netinfo, scorer
+from . import dnsq, netinfo, scorer
+from .dnsq import build_dns_query, dns_response_ok  # noqa: F401  (re-exported)
 from .config import Config
 from .models import NetProfile, SustainedResult, TestResult
 from .netinfo import NetError
@@ -123,34 +121,10 @@ def quick_speed(cfg: Config, max_seconds: float = 20.0) -> tuple[float | None, i
 
 # ---------------------------------------------------------------- dns
 
-def build_dns_query(domain: str, qid: int) -> bytes:
-    qname = b"".join(bytes([len(p)]) + p.encode("ascii") for p in domain.strip(".").split(".")) + b"\x00"
-    return struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
-
-
-def dns_response_ok(data: bytes, qid: int) -> bool:
-    if len(data) < 12:
-        return False
-    rid, flags, _qd, an = struct.unpack("!HHHH", data[:8])
-    return rid == qid and bool(flags & 0x8000) and (flags & 0xF) == 0 and an > 0
-
-
 def dns_query_ms(server: str, domain: str, timeout: float = 2.0) -> float | None:
     """Ask `server` directly (UDP/53) so we time the active DNS, not a local cache."""
-    qid = random.randrange(0x10000)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.settimeout(timeout)
-        t0 = time.perf_counter()
-        try:
-            s.sendto(build_dns_query(domain, qid), (server, 53))
-            while True:
-                data, _ = s.recvfrom(2048)
-                if dns_response_ok(data, qid):
-                    return (time.perf_counter() - t0) * 1000
-                if time.perf_counter() - t0 > timeout:
-                    return None
-        except OSError:
-            return None
+    ips, ms = dnsq.query_a(server, domain, timeout)
+    return ms if ips else None
 
 
 def dns_time(servers: list[str], domains: list[str]) -> float | None:
@@ -291,7 +265,8 @@ def run_all(
         return r
 
     def failed() -> bool:
-        return scorer.failure(r, cfg)[0] is not None
+        # final=False: with speed_rule = either, a low quick speed alone is not a failure yet
+        return scorer.failure(r, cfg, final=False)[0] is not None
 
     say("Gateway reachable?")
     r.gateway_ok = gateway_reachable(cfg.network.gateway)

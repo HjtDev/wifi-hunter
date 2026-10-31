@@ -257,3 +257,80 @@ def test_auto_reports_login_needed_if_neither_works(env, monkeypatch):
 def test_login_hook_can_resolve_portal(env, monkeypatch):
     f = fin(env, "default", portals=[("portal", 0, None), ("open", 0, None)], login=True, monkeypatch=monkeypatch)
     assert f.portal_state == "open" and f.portal_url is None
+
+
+# ---- auto-login inside the hunt, and settle_portal (used by `dorm-ip set`)
+def portal_cfg(env, **kw):
+    cfg = env["cfg"]
+    return replace(cfg, portal=replace(cfg.portal, enabled=True, url="http://p/login", login_during_hunt=True, **kw))
+
+
+def test_hunt_logs_in_on_portal_candidates(env, monkeypatch):
+    logins = []
+    monkeypatch.setattr(hunter, "_login", lambda c, ip="", mac="": logins.append(ip) or (True, "HTTP 200"))
+    hooks = []
+
+    def run_all(c, ip, mode, deep=True, *, on_portal=None, **kw):
+        hooks.append(on_portal)
+        if on_portal and ip == "172.18.40.1":
+            on_portal()
+        return result(ip, passed=(ip == "172.18.40.2"))
+
+    monkeypatch.setattr(nt, "run_all", run_all)
+    hunter.hunt(portal_cfg(env), **NOSLEEP)
+    assert logins == ["172.18.40.1"] and all(h is not None for h in hooks)
+
+
+def test_login_hook_absent_when_disabled(env, monkeypatch):
+    seen = []
+    monkeypatch.setattr(nt, "run_all", lambda c, ip, mode, deep=True, *, on_portal=None, **kw: seen.append(on_portal) or result(ip, passed=True))
+    hunter.hunt(env["cfg"], **NOSLEEP)  # portal.enabled is false in the fixture config
+    assert seen == [None]
+
+
+def test_login_stops_after_repeated_failures(env, monkeypatch):
+    attempts = []
+    monkeypatch.setattr(hunter, "_login", lambda c, ip="", mac="": attempts.append(ip) or (False, "portal rejected the login"))
+
+    def run_all(c, ip, mode, deep=True, *, on_portal=None, **kw):
+        if on_portal:
+            on_portal()
+        return result(ip, reason="captive portal: login required")
+
+    monkeypatch.setattr(nt, "run_all", run_all)
+    obs = Rec()
+    hunter.hunt(portal_cfg(env), observer=obs, **NOSLEEP)
+    assert len(attempts) == hunter.MAX_LOGIN_FAILURES  # protects the account from lock-outs
+    assert any("not trying again" in e[1] for e in obs.events if e[0] == "note")
+
+
+def test_login_is_capped_per_hunt(env, monkeypatch):
+    attempts = []
+    monkeypatch.setattr(hunter, "_login", lambda c, ip="", mac="": attempts.append(ip) or (True, "HTTP 200"))
+
+    def run_all(c, ip, mode, deep=True, *, on_portal=None, **kw):
+        if on_portal:
+            on_portal()
+        return result(ip)
+
+    monkeypatch.setattr(nt, "run_all", run_all)
+    hunter.hunt(portal_cfg(env, max_logins_per_hunt=2), **NOSLEEP)
+    assert len(attempts) == 2
+
+
+def test_settle_portal_open_logged_in_and_waiting(env, monkeypatch):
+    cfg = portal_cfg(env)
+    monkeypatch.setattr(hunter, "_login", lambda c, ip="", mac="": (True, "HTTP 200"))
+    states = iter([("dead", 0, None), ("portal", 0, "http://p/"), ("open", 0, None)])
+    monkeypatch.setattr(nt, "check_portal", lambda c: next(states))
+    st = hunter.settle_portal(cfg, "1.2.3.4", "aa", sleep=lambda s: None)
+    assert (st.state, st.logged_in) == ("open", True)
+
+
+def test_settle_portal_without_login_reports_url(env, monkeypatch):
+    monkeypatch.setattr(nt, "check_portal", lambda c: ("portal", 0, None))
+    st = hunter.settle_portal(env["cfg"], "1.2.3.4", "aa", sleep=lambda s: None)
+    assert st.state == "portal" and not st.logged_in and st.url == env["cfg"].tests.connectivity_url
+    assert "not enabled" in st.detail
+    st2 = hunter.settle_portal(portal_cfg(env), "1.2.3.4", "aa", login=False, sleep=lambda s: None)
+    assert "skipped" in st2.detail

@@ -16,6 +16,7 @@ from .models import NetProfile, TestResult
 from .netinfo import NetError
 
 MAX_CONSECUTIVE_APPLY_FAILURES = 3
+MAX_LOGIN_FAILURES = 2  # failed auto-logins before the hunt stops trying (avoids locking the account)
 DRY_RUN_CANDIDATES = 3
 
 
@@ -56,9 +57,55 @@ def _sigterm_as_interrupt() -> Iterator[None]:
         signal.signal(signal.SIGTERM, old)
 
 
+def _login(cfg: Config, ip: str = "", mac: str = "") -> tuple[bool, str]:
+    """Portal login with the portal host resolved through the dorm DNS (works under override DNS)."""
+    return portal.login_detail(cfg.portal, ip=ip, mac=mac, dorm_dns=cfg.dns.default)
+
+
 def try_login(cfg: Config, ip: str = "", mac: str = "") -> bool:
     """Single plug-in point for portal auto-login (False when [portal] is not enabled)."""
-    return portal.login(cfg.portal, ip=ip, mac=mac)
+    return _login(cfg, ip, mac)[0]
+
+
+@dataclass
+class PortalStatus:
+    state: str  # "open" | "portal" | "dead"
+    logged_in: bool
+    detail: str = ""
+    url: str | None = None  # where to log in by hand when state == "portal"
+
+
+def settle_portal(
+        cfg: Config,
+        ip: str,
+        mac: str,
+        *,
+        login: bool = True,
+        sleep: Callable[[float], None] = time.sleep,
+        attempts: int = 4,
+) -> PortalStatus:
+    """After changing the IP: wait for the link, check the portal and log in if needed."""
+    sleep(cfg.hunt.settle_seconds)
+    state, _b, url = nettests.check_portal(cfg)
+    for _ in range(attempts - 1):
+        if state != "dead":
+            break
+        sleep(2)
+        state, _b, url = nettests.check_portal(cfg)
+    logged_in, detail = False, ""
+    if state == "portal":
+        if not cfg.portal.enabled:
+            detail = "auto-login is not enabled"
+        elif not login:
+            detail = "auto-login skipped"
+        else:
+            logged_in, detail = _login(cfg, ip, mac)
+            if logged_in:
+                sleep(1)
+                state, _b, url = nettests.check_portal(cfg)
+    if state == "portal" and url is None:
+        url = cfg.tests.connectivity_url
+    return PortalStatus(state, logged_in and state == "open", detail, url if state == "portal" else None)
 
 
 def finalize(
@@ -141,7 +188,7 @@ def hunt(
     obs = observer or HuntObserver()
     results: list[TestResult] = []
     spent_bytes = spent or (lambda: sum(r.bytes_used for r in results))
-    budget = cfg.tests.data_budget_mb * 1_000_000
+    budget = cfg.tests.budget_bytes()
     use_override = cfg.dns.hunt_with_override
     dns = cfg.dns.override if use_override else cfg.dns.default
     dns_mode = "override" if use_override else "default"
@@ -160,6 +207,24 @@ def hunt(
             obs.scanned(used, todo)
 
             apply_failures = 0
+            login_failures = 0
+            logins_done = 0
+
+            def login_for(ip: str, mac: str) -> bool:
+                """Auto-login hook for a candidate that shows the portal (with safety limits)."""
+                nonlocal login_failures, logins_done
+                if login_failures >= MAX_LOGIN_FAILURES or logins_done >= cfg.portal.max_logins_per_hunt:
+                    return False
+                ok, detail = _login(cfg, ip, mac)
+                if ok:
+                    login_failures = 0
+                    logins_done += 1
+                    return True
+                login_failures += 1
+                suffix = "; not trying again during this hunt" if login_failures >= MAX_LOGIN_FAILURES else ""
+                obs.note(f"Auto-login failed ({detail}){suffix}")
+                return False
+
             for i, ip in enumerate(todo, 1):
                 if not dry_run and spent_bytes() >= budget:
                     obs.note("Daily data budget reached; stopping")
@@ -188,7 +253,7 @@ def hunt(
                 def run_tests(ip: str = ip, profile: NetProfile = profile) -> TestResult:
                     login_hook = None
                     if cfg.portal.enabled and cfg.portal.login_during_hunt:
-                        login_hook = lambda: try_login(cfg, ip, profile.mac)  # noqa: E731
+                        login_hook = lambda: login_for(ip, profile.mac)  # noqa: E731
                     return nettests.run_all(
                         cfg, ip, dns_mode, deep=True, seen_in_use=ip in used, profile=profile,
                         progress=lambda m: obs.stage(ip, m), on_portal=login_hook,

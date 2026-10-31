@@ -62,3 +62,41 @@ def test_partial_result_has_no_reason(cfg):
     r = make(ping_avg_ms=None, ping_loss_pct=None, quick_mbps=None,
              sustained_avg_mbps=None, sustained_min_mbps=None)
     assert scorer.failure(r, cfg) == (None, False)
+
+
+# ---- speed_rule = either
+def either(cfg, rule="either"):
+    from dataclasses import replace
+
+    return replace(cfg, thresholds=replace(cfg.thresholds, speed_rule=rule))
+
+
+def test_either_passes_when_only_sustained_is_fast(cfg):
+    c = either(cfg)
+    r = make(quick_mbps=2.0, sustained_avg_mbps=25.0, sustained_min_mbps=20.0)
+    assert scorer.score(r, c)[1] is True
+    assert scorer.score(r, either(cfg, "both"))[2].startswith("quick speed")
+
+
+def test_either_passes_when_only_quick_is_fast(cfg):
+    r = make(quick_mbps=30.0, sustained_avg_mbps=2.0, sustained_min_mbps=1.5)
+    assert scorer.score(r, either(cfg))[1] is True
+    assert "sustained" in scorer.score(r, either(cfg, "both"))[2]
+
+
+def test_either_fails_when_neither_is_fast(cfg):
+    r = make(quick_mbps=2.0, sustained_avg_mbps=3.0, sustained_min_mbps=1.5)
+    s, ok, why = scorer.score(r, either(cfg))
+    assert not ok and "neither reaches" in why
+
+
+def test_either_does_not_stop_between_stages_but_decides_at_the_end(cfg):
+    c = either(cfg)
+    quick_only = make(quick_mbps=2.0, sustained_avg_mbps=None, sustained_min_mbps=None)
+    assert scorer.failure(quick_only, c, final=False) == (None, False)  # sustained may still come
+    assert "quick speed" in scorer.failure(quick_only, c, final=True)[0]  # --no-deep: quick decides
+
+
+def test_collapse_still_hard_fails_under_either(cfg):
+    r = make(quick_mbps=30.0, sustained_avg_mbps=30.0, collapse_after_mb=2.0)
+    assert scorer.score(r, either(cfg)) == (0.0, False, "speed collapsed after 2.0 MB")

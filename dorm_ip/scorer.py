@@ -41,9 +41,13 @@ def loss_score(loss_pct: float | None, max_loss: float) -> float | None:
     return _clamp(100.0 * (1.0 - loss_pct / max_loss))
 
 
-def failure(r: TestResult, cfg: Config) -> tuple[str | None, bool]:
+def failure(r: TestResult, cfg: Config, final: bool = True) -> tuple[str | None, bool]:
     """First failing check as (reason, is_hard_fail). Metrics that were never measured
-    (None) are skipped: the hunt stops at the first failure, so later stages stay empty."""
+    (None) are skipped: the hunt stops at the first failure, so later stages stay empty.
+
+    final=False is used between stages of a running test: with speed_rule = "either" a low
+    quick speed is not a failure yet, because the sustained test may still reach the limit.
+    """
     th = cfg.thresholds
     if not r.gateway_ok:
         return "gateway unreachable", True
@@ -57,9 +61,22 @@ def failure(r: TestResult, cfg: Config) -> tuple[str | None, bool]:
         return f"speed collapsed after {r.collapse_after_mb:.1f} MB", True
     if r.ping_avg_ms is not None and r.ping_avg_ms > th.max_ping_ms:
         return f"ping {r.ping_avg_ms:.0f} ms > {th.max_ping_ms:g} ms", False
-    if r.quick_mbps is not None and r.quick_mbps < th.min_speed_mbps:
+    quick_low = r.quick_mbps is not None and r.quick_mbps < th.min_speed_mbps
+    sus_low = r.sustained_avg_mbps is not None and r.sustained_avg_mbps < th.min_sustained_mbps
+    if th.speed_rule == "either":
+        if r.sustained_avg_mbps is not None:
+            if quick_low and sus_low:
+                return (
+                    f"quick {r.quick_mbps:.1f} / sustained {r.sustained_avg_mbps:.1f} Mbps: "
+                    f"neither reaches {th.min_speed_mbps:g} / {th.min_sustained_mbps:g} Mbps",
+                    False,
+                )
+        elif quick_low and final:
+            return f"quick speed {r.quick_mbps:.1f} Mbps < {th.min_speed_mbps:g} Mbps", False
+        return None, False
+    if quick_low:
         return f"quick speed {r.quick_mbps:.1f} Mbps < {th.min_speed_mbps:g} Mbps", False
-    if r.sustained_avg_mbps is not None and r.sustained_avg_mbps < th.min_sustained_mbps:
+    if sus_low:
         return f"sustained {r.sustained_avg_mbps:.1f} Mbps < {th.min_sustained_mbps:g} Mbps", False
     return None, False
 

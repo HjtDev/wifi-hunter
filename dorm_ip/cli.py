@@ -16,11 +16,11 @@ from rich.live import Live
 from rich.markup import escape
 from rich.table import Table
 
-from . import applier, hunter, netinfo, portal, scanner, watchdog
+from . import applier, hunter, netinfo, portal, scanner, watchdog, wizard
 from . import tests as nettests
-from .config import Config, ConfigError, load_config, with_overrides
-from .db import DB, IpStats, open_db
-from .models import TestResult
+from .config import Config, ConfigError, default_config_path, find_config, load_config, with_overrides
+from .db import DB, IpStats, db_path, open_db
+from .models import NetProfile, TestResult
 from .netinfo import NetError
 
 app = typer.Typer(
@@ -86,6 +86,32 @@ def _begin_change(st: State, cfg: Config) -> str:
     return target.connection
 
 
+def _try_profile(st: State, cfg: Config) -> NetProfile | None:
+    """Current profile; in --dry-run a missing nmcli/wifi just returns None."""
+    try:
+        return netinfo.get_profile(cfg.network.interface, cfg.network.connection)
+    except NetError:
+        if st.dry_run:
+            return None
+        raise
+
+
+def _guard(cfg: Config, profile: NetProfile | None, *, vpn: bool, force: bool, ignore_vpn: bool = False) -> None:
+    """Refuse to run against the wrong network, or to measure a VPN instead of the dorm link."""
+    if profile is None:
+        return
+    msg = netinfo.check_dorm_network(profile, cfg)
+    if msg and not force:
+        raise NetError(f"{msg}. Use --force to continue anyway.")
+    if vpn and not ignore_vpn:
+        tun = netinfo.tunnel_device(profile.interface)
+        if tun:
+            raise NetError(
+                f"a VPN/tunnel ({tun}) is carrying your traffic, so the tests would measure the VPN, not the dorm "
+                "wifi, and changing the IP would drop it. Disconnect it first, or use --ignore-vpn."
+            )
+
+
 def _done(st: State, msg: str) -> None:
     out.print(("[dry-run] " if st.dry_run else "") + msg, markup=False, highlight=False)
 
@@ -122,17 +148,25 @@ def set_ip(
         ctx: typer.Context,
         ip: Annotated[str, typer.Argument(help="Static IPv4 address to apply.")],
         gw: Annotated[str | None, typer.Option("--gw", help="Gateway (overrides config).")] = None,
-        dns: Annotated[str | None, typer.Option("--dns", help="DNS servers, comma separated.")] = None,
+        dns: Annotated[str | None, typer.Option("--dns", help="DNS servers, comma separated (default: keep the current DNS).")] = None,
         prefix: Annotated[int | None, typer.Option("--prefix", help="Prefix length (overrides config).")] = None,
+        no_login: Annotated[bool, typer.Option("--no-login", help="Do not log in to the portal afterwards.")] = False,
+        force: Annotated[bool, typer.Option("--force", help="Skip the 'is this the dorm wifi?' check.")] = False,
 ) -> None:
-    """Apply a static IP to the configured connection."""
+    """Apply a static IP, keep the current DNS, and log in to the portal if it asks."""
     st: State = ctx.obj
     if gw is not None:
         _parse_ip(gw, "gateway")
     cfg = st.load(gateway=gw, prefix=prefix)
     addr = _parse_ip(ip)
     gateway, plen = cfg.network.gateway, cfg.network.prefix
-    dns_list = _parse_dns(dns) if dns else cfg.dns.default
+
+    current = _try_profile(st, cfg)
+    _guard(cfg, current, vpn=False, force=force)
+    if dns:
+        dns_list = _parse_dns(dns)
+    else:  # keep whatever DNS is active now (override stays override), else the dorm DNS
+        dns_list = current.dns if current and current.dns else cfg.dns.default
 
     net = ipaddress.ip_interface(f"{gateway}/{plen}").network
     if str(addr) == gateway:
@@ -143,6 +177,19 @@ def set_ip(
     conn = _begin_change(st, cfg)
     applier.apply_static(str(addr), plen, gateway, dns_list, connection=conn, dry_run=st.dry_run)
     _done(st, f"Applied {addr}/{plen} gw {gateway} dns {','.join(dns_list)} on '{conn}'")
+    if st.dry_run:
+        return
+
+    status = hunter.settle_portal(cfg, str(addr), current.mac if current else "", login=not no_login)
+    if status.state == "open" and status.logged_in:
+        out.print("[green]Portal asked for login: logged in automatically.[/green]")
+    elif status.state == "open":
+        out.print("[green]Portal open: no login needed.[/green]")
+    elif status.state == "portal":
+        why = f" ({escape(status.detail)})" if status.detail else ""
+        err.print(f"[bold yellow]Login required[/bold yellow]{why}. Run `dorm-ip login` or open {escape(status.url or '')}")
+    else:
+        err.print("[yellow]warning:[/yellow] no internet yet (connectivity check failed); the IP may be dead")
 
 
 @app.command()
@@ -230,11 +277,14 @@ def _print_result(r: TestResult, deep: bool) -> None:
 def test_cmd(
         ctx: typer.Context,
         no_deep: Annotated[bool, typer.Option("--no-deep", help="Skip the sustained download test.")] = False,
+        ignore_vpn: Annotated[bool, typer.Option("--ignore-vpn", help="Test even though a VPN carries the traffic.")] = False,
+        force: Annotated[bool, typer.Option("--force", help="Skip the 'is this the dorm wifi?' check.")] = False,
 ) -> None:
     """Run the full test suite on the current IP."""
     st: State = ctx.obj
     cfg = st.load()
     profile = netinfo.get_profile(cfg.network.interface, cfg.network.connection)
+    _guard(cfg, profile, vpn=True, force=force, ignore_vpn=ignore_vpn)
     if not profile.ip:
         raise NetError(f"'{profile.connection}' has no IPv4 address yet")
     mode = nettests.detect_dns_mode(profile, cfg)
@@ -371,11 +421,14 @@ def hunt_cmd(
         max_: Annotated[int | None, typer.Option("--max", help="Max candidates to try.")] = None,
         order: Annotated[str | None, typer.Option("--order", help="random | sequential | best-history")] = None,
         open_portal: Annotated[bool, typer.Option("--open-portal", help="Open the login page if login is required.")] = False,
+        ignore_vpn: Annotated[bool, typer.Option("--ignore-vpn", help="Hunt even though a VPN carries the traffic.")] = False,
+        force: Annotated[bool, typer.Option("--force", help="Skip the 'is this the dorm wifi?' check.")] = False,
 ) -> None:
     """Find a fast, stable IP: scan, try candidates, stop at the first that passes."""
     st: State = ctx.obj
     ranges = [r.strip() for r in range_.split(",") if r.strip()] if range_ else None
     cfg = st.load()
+    _guard(cfg, _try_profile(st, cfg), vpn=True, force=force, ignore_vpn=ignore_vpn)
     if ranges or max_ is not None or order:
         cfg = with_overrides(cfg, ranges=ranges, max_candidates=max_, order=order)
     obs = LiveHunt()
@@ -586,6 +639,67 @@ def login(
     if not ok or state != "open":
         raise SystemExit(1)
 
+
+
+@app.command("init")
+def init_cmd(
+        ctx: typer.Context,
+        yes: Annotated[bool, typer.Option("--yes", "-y", help="Accept every default; no questions.")] = False,
+        curl_file: Annotated[
+            Path | None, typer.Option("--curl-file", help="File with the portal login request ('Copy as cURL').")
+        ] = None,
+) -> None:
+    """Guided setup: writes config.toml and the credentials file."""
+    st: State = ctx.obj
+    target = st.config_path or default_config_path()
+    say = lambda m: out.print(m, markup=False, highlight=False)  # noqa: E731
+    prompter = wizard.AutoPrompter(say) if yes else wizard.TyperPrompter(say)
+    curl_text = curl_file.read_text() if curl_file else None
+    result = wizard.run_init(prompter, target=target, curl_text=curl_text, source=wizard.existing_source())
+    if result is None:
+        out.print("Nothing changed.")
+        return
+    out.print(f"\nConfig written: {result.config_path}")
+    if result.credentials_path:
+        out.print(f"Credentials saved (chmod 600): {result.credentials_path}")
+    for n in result.notes:
+        err.print(f"[yellow]note:[/yellow] {escape(n)}")
+    other = Path("config.toml")
+    if st.config_path is None and other.is_file() and other.resolve() != result.config_path.resolve():
+        out.print("Note: ./config.toml exists but the file above takes precedence.", markup=False)
+    out.print(
+        "\nNext steps:\n"
+        "  dorm-ip info            check the detected network\n"
+        "  dorm-ip login --force  test the portal login\n"
+        "  dorm-ip hunt            find a good IP\n"
+        "  dorm-ip watch           keep it good",
+        markup=False, highlight=False,
+    )
+
+
+@app.command("path")
+def path_cmd(
+        ctx: typer.Context,
+        what: Annotated[str, typer.Argument(help="config | credentials | db | backup")],
+) -> None:
+    """Print a file location (used by the Makefile)."""
+    st: State = ctx.obj
+    if what == "config":
+        try:
+            print(find_config(st.config_path))
+        except ConfigError:
+            print(st.config_path or default_config_path())
+    elif what == "credentials":
+        try:
+            print(Path(load_config(st.config_path).portal.credentials_file).expanduser())
+        except ConfigError:
+            print(Path("~/.config/dorm-ip/credentials.toml").expanduser())
+    elif what == "db":
+        print(db_path())
+    elif what == "backup":
+        print(applier.backup_path())
+    else:
+        raise ConfigError("what must be one of: config, credentials, db, backup")
 
 
 def main() -> None:
