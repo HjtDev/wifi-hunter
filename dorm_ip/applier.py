@@ -6,12 +6,55 @@ import json
 import os
 import shlex
 import sys
-from dataclasses import asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import netinfo
 from .models import NetProfile
 from .netinfo import NetError
+
+
+PLACEHOLDER_CONN = "<active-wifi-connection>"
+
+
+@dataclass
+class Target:
+    connection: str
+    device: str
+
+
+def begin_change(
+        interface: str,
+        connection: str,
+        *,
+        dry_run: bool = False,
+        notify: Callable[[str], None] | None = None,
+) -> Target:
+    """Resolve the one connection we may modify and back up its original profile.
+
+    In dry-run mode, missing nmcli/wifi falls back to a placeholder so the commands
+    can still be previewed.
+    """
+    say = notify or (lambda m: _say(m))
+    try:
+        conn, dev, notes = netinfo.resolve_connection(interface, connection)
+    except NetError as e:
+        if not dry_run:
+            raise
+        say(f"note: {e}; using a placeholder for --dry-run")
+        return Target(PLACEHOLDER_CONN, interface)
+    for n in notes:
+        say(f"note: {n}")
+    try:
+        profile = netinfo.get_profile(interface, conn)
+    except NetError as e:
+        if not dry_run:
+            raise
+        say(f"note: cannot read profile ({e}); skipping backup in --dry-run")
+        return Target(conn, dev)
+    backup_profile(profile, dry_run=dry_run)
+    return Target(conn, dev)
 
 
 def backup_path() -> Path:

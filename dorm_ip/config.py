@@ -248,8 +248,16 @@ def with_overrides(
         ranges: list[str] | None = None,
         gateway: str | None = None,
         prefix: int | None = None,
+        max_candidates: int | None = None,
+        order: str | None = None,
 ) -> Config:
     """Apply per-run CLI overrides and re-expand/validate."""
+    hunt = cfg.hunt
+    if max_candidates is not None:
+        hunt = replace(hunt, max_candidates=max_candidates)
+    if order is not None:
+        hunt = replace(hunt, order=order)
+    cfg = replace(cfg, hunt=hunt)
     net = cfg.network
     if ranges is not None:
         net = replace(net, ranges=ranges)

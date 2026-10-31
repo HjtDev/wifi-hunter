@@ -1,16 +1,19 @@
 """Thin typer CLI. Logic lives in the other modules."""
 
 import ipaddress
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.live import Live
 from rich.markup import escape
 from rich.table import Table
 
-from . import applier, netinfo
+from . import applier, hunter, netinfo, scanner
 from . import tests as nettests
 from .config import Config, ConfigError, load_config, with_overrides
 from .models import TestResult
@@ -26,9 +29,6 @@ app.add_typer(dns_app, name="dns")
 
 out = Console()
 err = Console(stderr=True)
-
-PLACEHOLDER_CONN = "<active-wifi-connection>"
-
 
 @dataclass
 class State:
@@ -71,32 +71,15 @@ def _parse_dns(value: str) -> list[str]:
     return [str(_parse_ip(s, "DNS server")) for s in servers]
 
 
-def _resolve(st: State, cfg: Config) -> str:
-    """Connection name to modify (only the configured/active wifi one)."""
-    try:
-        conn, _dev, notes = netinfo.resolve_connection(cfg.network.interface, cfg.network.connection)
-    except NetError as e:
-        if not st.dry_run:
-            raise
-        err.print(f"[yellow]note:[/yellow] {escape(str(e))}; using a placeholder for --dry-run")
-        return PLACEHOLDER_CONN
-    for n in notes:
-        err.print(f"[yellow]note:[/yellow] {escape(n)}")
-    return conn
-
-
 def _begin_change(st: State, cfg: Config) -> str:
     """Resolve the connection and back up the original profile before changing anything."""
-    conn = _resolve(st, cfg)
-    try:
-        profile = netinfo.get_profile(cfg.network.interface, conn)
-    except NetError as e:
-        if not st.dry_run:
-            raise
-        err.print(f"[yellow]note:[/yellow] cannot read profile ({escape(str(e))}); skipping backup in --dry-run")
-        return conn
-    applier.backup_profile(profile, dry_run=st.dry_run)
-    return conn
+    target = applier.begin_change(
+        cfg.network.interface,
+        cfg.network.connection,
+        dry_run=st.dry_run,
+        notify=lambda m: err.print(f"[yellow]{escape(m)}[/yellow]"),
+    )
+    return target.connection
 
 
 def _done(st: State, msg: str) -> None:
@@ -259,12 +242,177 @@ def test_cmd(
     _print_result(result, deep=not no_deep)
 
 
+@app.command()
+def scan(ctx: typer.Context) -> None:
+    """Show which candidate IPs are seen in use (arp-scan) and the order they would be tried."""
+    st: State = ctx.obj
+    cfg = st.load()
+    _conn, device, notes = _scan_target(st, cfg)
+    for n in notes:
+        err.print(f"[yellow]note:[/yellow] {escape(n)}")
+    used = scanner.scan_used(cfg, device, dry_run=st.dry_run)
+    if st.dry_run:
+        return
+    ordered = scanner.candidates(cfg, used)
+    unused = len(cfg.ips) - len(used)
+    out.print(f"Candidates: {len(cfg.ips)}   seen in use: {len(used)}   unused: {unused}")
+    if not used:
+        err.print("[yellow]warning:[/yellow] no hosts answered ARP (client isolation or wrong interface?)")
+    else:
+        key = lambda ip: tuple(int(x) for x in ip.split("."))  # noqa: E731
+        out.print("In use: " + ", ".join(sorted(used, key=key)), markup=False, highlight=False)
+    out.print("Would try first: " + ", ".join(ordered[:10]), markup=False, highlight=False)
+
+
+def _scan_target(st: State, cfg: Config) -> tuple[str, str, list[str]]:
+    try:
+        return netinfo.resolve_connection(cfg.network.interface, cfg.network.connection)
+    except NetError:
+        if st.dry_run:
+            return applier.PLACEHOLDER_CONN, cfg.network.interface, []
+        raise
+
+
+class LiveHunt(hunter.HuntObserver):
+    """Rich live table for `hunt`."""
+
+    def __init__(self) -> None:
+        self.rows: list[tuple[str, ...]] = []
+        self.current: tuple[str, int, int, str] | None = None  # ip, index, total, stage
+        self.live: Live | None = None
+        self.final: hunter.Finalized | None = None
+        self.tried = 0
+
+    def _table(self) -> Table:
+        t = Table(box=None, pad_edge=False)
+        for col in ("#", "IP", "Seen", "Ping", "Quick", "Sustained", "Collapse", "Score", "Result"):
+            t.add_column(col)
+        for row in self.rows:
+            t.add_row(*row)
+        if self.current:
+            ip, i, total, stage = self.current
+            t.add_row(f"{i}/{total}", ip, "", "", "", "", "", "", f"[dim]{escape(stage)}[/dim]")
+        return t
+
+    def _refresh(self) -> None:
+        if self.live:
+            self.live.update(self._table())
+
+    def note(self, text: str) -> None:
+        (self.live.console if self.live else err).print(f"[yellow]{escape(text)}[/yellow]")
+
+    def scanned(self, used: set[str], candidates: list[str]) -> None:
+        out.print(f"{len(used)} IPs seen in use. Trying up to {len(candidates)} candidates, unused first.")
+        self.live = Live(self._table(), console=out, refresh_per_second=8)
+        self.live.start()
+
+    def trying(self, ip: str, index: int, total: int) -> None:
+        self.current = (ip, index, total, "applying")
+        self._refresh()
+
+    def stage(self, ip: str, text: str) -> None:
+        if self.current:
+            self.current = (*self.current[:3], text)
+            self._refresh()
+
+    def skipped(self, ip: str, why: str) -> None:
+        idx = self.current[1] if self.current else len(self.rows) + 1
+        self.rows.append((str(idx), ip, "", "", "", "", "", "", f"[red]skipped[/red] {escape(why[:40])}"))
+        self.current = None
+        self._refresh()
+
+    def result(self, r: TestResult) -> None:
+        self.tried += 1
+        idx = self.current[1] if self.current else self.tried
+        sus = "-" if r.sustained_avg_mbps is None else f"{r.sustained_avg_mbps:.1f}/{r.sustained_min_mbps:.1f}"
+        coll = "-" if r.sustained_avg_mbps is None else ("none" if r.collapse_after_mb is None else f"{r.collapse_after_mb:.1f} MB")
+        status = "[green]PASS[/green]" if r.passed else f"[red]{escape((r.fail_reason or 'fail')[:42])}[/red]"
+        self.rows.append((
+            str(idx), r.ip, "yes" if r.seen_in_use else "", _fmt(r.ping_avg_ms, "", 0).strip(),
+            _fmt(r.quick_mbps, "").strip(), sus, coll, f"{r.score:.0f}", status,
+        ))
+        self.current = None
+        self._refresh()
+
+    def finalized(self, f: hunter.Finalized) -> None:
+        self.final = f
+
+    def close(self) -> None:
+        if self.live:
+            self.current = None
+            if self.rows:
+                self._refresh()
+            else:
+                self.live.update("")
+            self.live.stop()
+            self.live = None
+
+
+def _open_portal(url: str) -> None:
+    if shutil.which("xdg-open") is None:
+        err.print("[yellow]xdg-open not found; open the login page manually[/yellow]")
+        return
+    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+@app.command("hunt")
+def hunt_cmd(
+        ctx: typer.Context,
+        range_: Annotated[
+            str | None,
+            typer.Option("--range", help="IP range(s) to try, e.g. 172.18.40.1-172.18.40.50 (comma separated)."),
+        ] = None,
+        max_: Annotated[int | None, typer.Option("--max", help="Max candidates to try.")] = None,
+        order: Annotated[str | None, typer.Option("--order", help="random | sequential | best-history")] = None,
+        open_portal: Annotated[bool, typer.Option("--open-portal", help="Open the login page if login is required.")] = False,
+) -> None:
+    """Find a fast, stable IP: scan, try candidates, stop at the first that passes."""
+    st: State = ctx.obj
+    ranges = [r.strip() for r in range_.split(",") if r.strip()] if range_ else None
+    cfg = st.load()
+    if ranges or max_ is not None or order:
+        cfg = with_overrides(cfg, ranges=ranges, max_candidates=max_, order=order)
+    if cfg.hunt.order == "best-history":
+        err.print("[yellow]note:[/yellow] no history yet (phase 4); best-history falls back to random order")
+
+    obs = LiveHunt()
+    try:
+        result = hunter.hunt(cfg, observer=obs, dry_run=st.dry_run)
+    finally:
+        obs.close()
+
+    if st.dry_run:
+        out.print("[dry-run] no tests were run and nothing was changed", markup=False)
+        return
+    if result is None:
+        err.print(f"[red]No passing IP found[/red] after {obs.tried} tried. Original profile restored.")
+        raise SystemExit(1)
+
+    out.print()
+    _print_result(result, deep=True)
+    f = obs.final
+    if f is None:
+        return
+    out.print(f"\nKept {result.ip} with {f.dns_mode} DNS.")
+    if f.portal_state == "open":
+        out.print("[green]Portal open: no login needed.[/green]")
+    elif f.portal_state == "portal":
+        out.print("[bold yellow]Login required[/bold yellow]" + (f": {escape(f.portal_url)}" if f.portal_url else ""))
+        if open_portal and f.portal_url:
+            _open_portal(f.portal_url)
+    else:
+        err.print("[yellow]warning:[/yellow] portal check failed after finalizing DNS")
+
+
 def main() -> None:
     try:
         app()
     except (ConfigError, NetError) as e:
         err.print(f"[red]error:[/red] {escape(str(e))}")
         raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        err.print("\n[yellow]Interrupted.[/yellow]")
+        raise SystemExit(130) from None
 
 
 if __name__ == "__main__":
