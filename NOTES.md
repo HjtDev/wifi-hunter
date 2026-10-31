@@ -38,3 +38,28 @@ Decisions made where the spec was ambiguous (simplest option chosen).
 - `bytes_used` counts HTTP payload only; ping/DNS traffic is ignored. One deep test costs roughly
   speed x sustained_seconds (e.g. 30 Mbps x 8 s = 30 MB) plus the 5 MB quick test.
 - `test` does not save to the database yet (phase 4).
+
+## Phase 3
+- `scan_used` runs arp-scan only over `network.ranges`. If arp-scan fails with a permission error and we are not
+  root, it retries once with `sudo` (password prompt works in the terminal). To avoid the prompt:
+  `sudo setcap cap_net_raw,cap_net_admin=eip /usr/bin/arp-scan`. A missing/failed scan is not fatal for `hunt`:
+  every IP is treated as unused and a note is shown. Results are intersected with the candidate list.
+- Ordering: `prefer_unused` puts IPs not seen in ARP first; used IPs are kept, just later. Within a group:
+  random | sequential | best-history. `best-history` takes a `scores` dict (phase 4 will supply it); with none it is random.
+- Hunter never prints; it talks to a `HuntObserver` (the CLI's `LiveHunt` draws the rich table).
+  Hooks for phase 4 already exist: `hunt(..., spent=db.daily_bytes, save=db.save, history=db.scores)`.
+  Until then the data budget counts only the current run's traffic.
+- Restore happens when nothing passes, on any exception, on Ctrl+C and on SIGTERM (mapped to KeyboardInterrupt).
+  `restore` consumes the backup, so a later `dorm-ip restore` after a failed hunt says "nothing to restore" (already done).
+  After a successful hunt the backup is kept, so `dorm-ip restore` still returns to the original profile.
+- Applying an IP can fail (`con up` error): that candidate is skipped; 3 consecutive failures abort the hunt (and restore).
+- A candidate that fails with "gateway unreachable" is retried once after another `settle_seconds`, because wifi may
+  still be re-associating after `con up`.
+- Finalize (dns.final_mode): `default` -> switch to dorm DNS + portal check; `override` -> keep/switch to override;
+  `auto` -> override if the portal check is `open`, otherwise dorm DNS and re-check. A test that passed already proved
+  `open` under its DNS, so no re-check is done unless the DNS was switched. If still `portal`: `hunter.try_login()`
+  (phase 6 stub, returns False), then "Login required" and, with `--open-portal`, `xdg-open <Location header or
+  connectivity_url>`.
+- `--dry-run hunt`: prints the arp-scan command and the nmcli commands for the first 3 candidates; runs no tests and
+  does not touch the backup or the network. `hunt` exits 1 when no IP passes, 130 on Ctrl+C.
+- New options: `hunt --range A-B[,C-D] --max N --order ... --open-portal`; new command `scan`.
