@@ -63,3 +63,46 @@ Decisions made where the spec was ambiguous (simplest option chosen).
 - `--dry-run hunt`: prints the arp-scan command and the nmcli commands for the first 3 candidates; runs no tests and
   does not touch the backup or the network. `hunt` exits 1 when no IP passes, 130 on Ctrl+C.
 - New options: `hunt --range A-B[,C-D] --max N --order ... --open-portal`; new command `scan`.
+
+## Phase 4 (db, history, budget)
+- History DB: `~/.local/share/dorm-ip/history.db` (`$XDG_DATA_HOME/dorm-ip/`). Tables: `results` (every TestResult incl. MAC),
+  `checks` (watchdog), `daily_usage(day, bytes)`. The day is the *local* calendar day (the dorm quota reset time is unknown).
+- `test` and `hunt` save every result. `hunt` and `watch` pass `spent=db.daily_bytes`, so the budget is the real
+  daily total (tests + watchdog probes + confirmation tests), not just the current run.
+- `best-history` ordering: per IP, mean of its last 5 results where a failed test counts as 0 (reliability x quality).
+  IPs without history are neutral (50) and keep their random order; with no history at all it is plain random.
+- `history`: top N by that reliability-weighted score, pass %, average score of passing tests, sustained Mbps, good
+  hours (hours where the IP passed >= 50% of its tests there), last test, flag (`bad` = 0 passes in >= 3 tests,
+  `flaky` = < 50% in >= 3 tests). Also: IPs that often fail, pass rate by hour of day (all IPs), and pass rate for
+  IPs seen in use vs unused (to check the shared-IP assumption).
+
+## Phase 5 (watchdog)
+- Every `interval_seconds`: 3 pings to the gateway + a `probe_bytes` download on a persistent connection (speed is
+  measured after the response headers). A check is bad on: gateway unreachable, loss > max_loss_pct, probe failed
+  (HTTP error, timeout, or a body shorter than half the expected size, e.g. a portal page), or probe speed below
+  `watchdog.min_probe_mbps`.
+- New optional keys: `watchdog.min_probe_mbps` (default 1.0 instead of `thresholds.min_speed_mbps`, because a
+  200 KB probe on a ~180 ms link is dominated by TCP slow start and would read far below 5 Mbps on a healthy IP) and
+  `watchdog.rehunt_cooldown_seconds` (default 300).
+- After `bad_checks_to_rehunt` consecutive bad checks the watchdog: (1) notifies; (2) checks the portal: if it asks
+  for login it tries `portal.login()` (session expired is cheaper to fix than a new IP) and stops if that worked;
+  (3) otherwise runs a real quick test on the current IP (about 5 MB): if it passes it is a false alarm and the
+  watchdog holds off for the cooldown; (4) otherwise re-hunts (skipped if today's budget is spent).
+- A failed re-hunt restores the original profile (as `hunt` does) and the next attempt waits cooldown, 2x, 4x ...
+  up to 30 minutes. A successful re-hunt checks the portal and notifies "Login required" if needed.
+- Wifi disconnected = a bad check. Ctrl+C / SIGTERM stops the watcher and leaves the current IP as it is.
+- Watchdog traffic counts toward the daily budget: 200 KB every 10 s is about 1.7 GB/day. Use a longer interval
+  (30-60 s) if the daily limit matters.
+- `notify-send` is used for notifications; failures (no desktop session, e.g. under sudo) are ignored.
+
+## Phase 6, part 1 (auto-login). MAC randomization and TUI are NOT built yet.
+- `[portal]` in config.toml describes the login request (url, method, form/json fields, query, headers). The tokens
+  `{username}` `{password}` `{ip}` `{mac}` are replaced at send time; other braces are left alone. Success = HTTP < 400
+  after redirects, plus optional `success_contains` / `failure_contains` text checks. `enabled = false` by default.
+- Credentials are never in config.toml: `~/.config/dorm-ip/credentials.toml` with `username` and `password`,
+  refused unless `chmod 600`. Optional `keyring_service` reads `username`/`password` from the system keyring
+  (needs the `keyring` package). Credentials are never printed or included in error messages.
+- `dorm-ip login [--force]` tests the setup: shows the portal state, sends the request, shows the state again.
+- Used by: `hunter.finalize` (when the final DNS still shows the portal), the watchdog (expired session), and
+  optionally during the hunt: `portal.login_during_hunt = true` logs in on every candidate that shows the portal,
+  then tests it. Off by default because it creates a portal session per candidate and may log out other sessions.
