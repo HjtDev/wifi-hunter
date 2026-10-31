@@ -208,7 +208,7 @@ def fin(env, mode, tested_with="override", portals=(), login=False, monkeypatch=
     cfg = replace(cfg, dns=replace(cfg.dns, final_mode=mode))
     queue = list(portals)
     monkeypatch.setattr(nt, "check_portal", lambda c: queue.pop(0))
-    monkeypatch.setattr(hunter, "try_login", lambda c: login)
+    monkeypatch.setattr(hunter, "try_login", lambda c, ip="", mac="": login)
     r = result("172.18.40.9", passed=True)
     r.dns_mode = tested_with
     return hunter.finalize(cfg, r, applier.Target("Dorm", "wlan0"), sleep=lambda s: None)
