@@ -125,3 +125,7 @@ dmypy.json
 
 # Pycharm
 .idea/
+
+# Personal configurations
+config.toml
+credentials.toml
