@@ -106,3 +106,30 @@ Decisions made where the spec was ambiguous (simplest option chosen).
 - Used by: `hunter.finalize` (when the final DNS still shows the portal), the watchdog (expired session), and
   optionally during the hunt: `portal.login_during_hunt = true` logs in on every candidate that shows the portal,
   then tests it. Off by default because it creates a portal session per candidate and may log out other sessions.
+
+## Phase 6, part 2 + setup (init, Makefile, README)
+- `dorm-ip init` writes `~/.config/dorm-ip/config.toml` (XDG) and the credentials file (chmod 600). Config lookup is now:
+  `--config`, then `~/.config/dorm-ip/config.toml`, then `./config.toml`. The template and defaults live in
+  `dorm_ip/config.example.toml`; the repo no longer needs a real `config.toml` (add `config.toml` and
+  `credentials.toml` to `.gitignore`). Re-running init uses the existing values as defaults and keeps a `.bak`.
+- Portal login request comes from a pasted "Copy as cURL": username/password/IP/MAC become `{username}` `{password}`
+  `{ip}` `{mac}`; cookies, content-length, sec-* and similar headers are dropped. Real portal details therefore live
+  only in the user-level config, never in the repository.
+- Portal host resolution: the login resolves the portal host by querying `dns.default` directly (UDP/53) and connects
+  to that IP with the original Host/SNI, so login works while the system DNS is the override. `portal.host_ip`
+  pins it. A failed DNS answer falls back to the system resolver.
+- `login_during_hunt` is on in the shipped template (the user asked for it). Safety: after 2 failed logins the hunt stops
+  trying; `max_logins_per_hunt` (10) caps successful logins.
+- `dorm-ip set` keeps the current DNS (override stays override) unless `--dns` is given, waits for the link, and logs in if
+  the portal asks (`--no-login` to skip).
+- Safety guards: `set`/`test`/`hunt` refuse when the live gateway differs from `network.gateway` (`--force`);
+  `test`/`hunt` refuse while a tunnel device carries the default route (`ip route get 1.1.1.1`, `--ignore-vpn`).
+- Watchdog never judges the link when: wifi is down, another network is connected, a VPN carries the traffic (gateway-only
+  checks, no re-hunt), the machine just resumed from suspend (wall-clock gap > 3x interval + 10 s -> 60 s grace), or
+  a slow probe coincides with your own traffic on the interface (> `busy_mbps`).
+- `thresholds.speed_rule = "either"`: pass when the quick OR the sustained speed reaches its limit. Between stages a low
+  quick speed does not stop the test (sustained may still pass); collapse is still a hard fail.
+- Defaults chosen where the request was cut off: `max_ping_ms = 250` (a good IP measured about 180 ms); "1 MB of speed" is read
+  as 1 MB/s = 8 Mbps for both quick and sustained; `order = "best-history"`; `final_mode = "override"`;
+  watchdog `interval_seconds = 30`.
+- `data_budget_mb = 0` means unlimited.
