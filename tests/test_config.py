@@ -73,3 +73,41 @@ def test_overrides_recompute(tmp_path):
     c2 = with_overrides(cfg, ranges=["172.18.40.1-172.18.40.3"])
     assert c2.ips == ["172.18.40.1", "172.18.40.2", "172.18.40.3"]
     assert len(cfg.ips) > 3  # original untouched
+
+
+PORTAL = """
+[portal]
+enabled = true
+url = "http://portal.local/login"
+fields = { user = "{username}", pass = "{password}" }
+headers = { X-A = "1" }
+"""
+
+
+def test_portal_section_parsed(tmp_path):
+    cfg = load_config(write(tmp_path, BASE + PORTAL))
+    assert cfg.portal.enabled and cfg.portal.fields == {"user": "{username}", "pass": "{password}"}
+    assert cfg.portal.login_during_hunt is False and cfg.portal.method == "POST"
+
+
+def test_portal_defaults_disabled(tmp_path):
+    assert load_config(write(tmp_path, BASE)).portal.enabled is False
+
+
+def test_portal_validation(tmp_path):
+    with pytest.raises(ConfigError, match="portal.url"):
+        load_config(write(tmp_path, BASE + "[portal]\nenabled = true\n"))
+    with pytest.raises(ConfigError, match="wrong type"):
+        load_config(write(tmp_path, BASE + '[portal]\nfields = { a = 1 }\n'))
+    with pytest.raises(ConfigError, match="method"):
+        load_config(write(tmp_path, BASE + '[portal]\nmethod = "PUT"\n'))
+
+
+def test_watchdog_new_keys_have_defaults(tmp_path):
+    cfg = load_config(write(tmp_path, BASE))
+    assert cfg.watchdog.min_probe_mbps == 1.0 and cfg.watchdog.rehunt_cooldown_seconds == 300
+
+
+def test_override_max_and_order(tmp_path):
+    cfg = with_overrides(load_config(write(tmp_path, BASE)), max_candidates=7, order="sequential")
+    assert cfg.hunt.max_candidates == 7 and cfg.hunt.order == "sequential"

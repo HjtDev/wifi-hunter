@@ -232,3 +232,20 @@ def test_detect_dns_mode(cfg):
     assert nt.detect_dns_mode(p2, cfg) == "default"
     p3 = NetProfile("w", "c", "auto", "1.1.1.1", 21, "g", ["9.9.9.9"], "m")
     assert nt.detect_dns_mode(p3, cfg) == "custom"
+
+
+def test_run_all_logs_in_when_portal_blocks(cfg, monkeypatch):
+    states = iter([("portal", 800, "http://p/"), ("open", 0, None)])
+    calls = stub(monkeypatch)
+    monkeypatch.setattr(nt, "check_portal", lambda c: next(states))
+    logged = []
+    r = nt.run_all(cfg, "x", "override", profile=PROFILE, on_portal=lambda: logged.append(1) or True)
+    assert logged == [1] and r.passed and r.portal_state == "open"
+    assert calls[-1] == "sus"
+
+
+def test_run_all_portal_login_failure_still_fails(cfg, monkeypatch):
+    stub(monkeypatch)
+    monkeypatch.setattr(nt, "check_portal", lambda c: ("portal", 800, "http://p/"))
+    r = nt.run_all(cfg, "x", "override", profile=PROFILE, on_portal=lambda: False)
+    assert not r.passed and "login required" in r.fail_reason

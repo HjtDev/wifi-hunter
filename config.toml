@@ -24,9 +24,9 @@ sample_interval    = 0.5
 data_budget_mb     = 9999999              # daily cap for test traffic
 
 [thresholds]
-max_ping_ms         = 200
+max_ping_ms         = 500
 max_loss_pct        = 2
-min_speed_mbps      = 5
+min_speed_mbps      = 1
 min_sustained_mbps  = 4
 collapse_below_mbps = 1                # speed under this for >= 2 s counts as collapse
 

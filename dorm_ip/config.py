@@ -72,6 +72,30 @@ class WatchdogCfg:
     probe_bytes: int = 200000
     bad_checks_to_rehunt: int = 3
     notify: bool = True
+    # A 200 KB probe is dominated by TCP slow start, so it gets its own, lower speed limit.
+    min_probe_mbps: float = 1.0
+    # After a failed re-hunt wait this long (doubling each time, max 30 min) before trying again.
+    rehunt_cooldown_seconds: float = 300
+
+
+@dataclass
+class PortalCfg:
+    """Captive-portal auto-login. Credentials never live here (see credentials_file)."""
+
+    enabled: bool = False
+    url: str = ""
+    method: str = "POST"  # GET | POST
+    content_type: str = "form"  # form | json (POST body encoding)
+    fields: dict[str, str] = field(default_factory=dict)  # body (POST) or extra query (GET)
+    query: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+    success_contains: str = ""  # text that must appear in the response ("" = any HTTP < 400)
+    failure_contains: str = ""  # text that means the login was rejected
+    credentials_file: str = "~/.config/dorm-ip/credentials.toml"
+    keyring_service: str = ""  # optional: read username/password from the system keyring
+    login_during_hunt: bool = False  # log in on candidates that show the portal (see NOTES)
+    verify_tls: bool = True
+    timeout: float = 10
 
 
 @dataclass
@@ -82,6 +106,7 @@ class Config:
     thresholds: ThresholdsCfg
     hunt: HuntCfg
     watchdog: WatchdogCfg
+    portal: PortalCfg
     # computed by finalize():
     ips: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -105,6 +130,8 @@ def _check(value: object, hint: object, name: str) -> object:
         ok = isinstance(value, str)
     elif typing.get_origin(hint) is list:
         ok = isinstance(value, list) and all(isinstance(x, str) for x in value)
+    elif typing.get_origin(hint) is dict:
+        ok = isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items())
     else:  # pragma: no cover - only reachable by adding a new field type
         raise ConfigError(f"internal: unsupported type for {name}")
     if not ok:
@@ -165,6 +192,13 @@ def _validate(cfg: Config) -> None:
         raise ConfigError(f"config: hunt.order must be one of {sorted(_VALID_ORDER)}")
     if not n.ranges:
         raise ConfigError("config: network.ranges is empty")
+    p = cfg.portal
+    if p.method.upper() not in ("GET", "POST"):
+        raise ConfigError("config: portal.method must be GET or POST")
+    if p.content_type not in ("form", "json"):
+        raise ConfigError("config: portal.content_type must be 'form' or 'json'")
+    if p.enabled and not p.url:
+        raise ConfigError("config: portal.enabled is true but portal.url is empty")
 
 
 def finalize(cfg: Config) -> Config:
@@ -222,7 +256,7 @@ def load_config(path: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{p}: invalid TOML: {e}") from None
 
-    known = {"network", "dns", "tests", "thresholds", "hunt", "watchdog"}
+    known = {"network", "dns", "tests", "thresholds", "hunt", "watchdog", "portal"}
     unknown = set(raw) - known
     if unknown:
         raise ConfigError(f"config: unknown section(s): {', '.join(sorted(unknown))}")
@@ -237,6 +271,7 @@ def load_config(path: Path | None = None) -> Config:
         thresholds=_build(ThresholdsCfg, raw.get("thresholds", {}), "thresholds"),
         hunt=_build(HuntCfg, raw.get("hunt", {}), "hunt"),
         watchdog=_build(WatchdogCfg, raw.get("watchdog", {}), "watchdog"),
+        portal=_build(PortalCfg, raw.get("portal", {}), "portal"),
         source=p,
     )
     return finalize(cfg)
