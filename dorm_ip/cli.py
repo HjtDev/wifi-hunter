@@ -11,7 +11,9 @@ from rich.markup import escape
 from rich.table import Table
 
 from . import applier, netinfo
+from . import tests as nettests
 from .config import Config, ConfigError, load_config, with_overrides
+from .models import TestResult
 from .netinfo import NetError
 
 app = typer.Typer(
@@ -44,11 +46,11 @@ class State:
 
 @app.callback()
 def _root(
-    ctx: typer.Context,
-    config: Annotated[Path | None, typer.Option("--config", help="Path to config.toml.")] = None,
-    dry_run: Annotated[
-        bool, typer.Option("--dry-run", help="Print the exact nmcli commands instead of running them.")
-    ] = False,
+        ctx: typer.Context,
+        config: Annotated[Path | None, typer.Option("--config", help="Path to config.toml.")] = None,
+        dry_run: Annotated[
+            bool, typer.Option("--dry-run", help="Print the exact nmcli commands instead of running them.")
+        ] = False,
 ) -> None:
     ctx.obj = State(config, dry_run)
 
@@ -130,11 +132,11 @@ def info(ctx: typer.Context) -> None:
 
 @app.command("set")
 def set_ip(
-    ctx: typer.Context,
-    ip: Annotated[str, typer.Argument(help="Static IPv4 address to apply.")],
-    gw: Annotated[str | None, typer.Option("--gw", help="Gateway (overrides config).")] = None,
-    dns: Annotated[str | None, typer.Option("--dns", help="DNS servers, comma separated.")] = None,
-    prefix: Annotated[int | None, typer.Option("--prefix", help="Prefix length (overrides config).")] = None,
+        ctx: typer.Context,
+        ip: Annotated[str, typer.Argument(help="Static IPv4 address to apply.")],
+        gw: Annotated[str | None, typer.Option("--gw", help="Gateway (overrides config).")] = None,
+        dns: Annotated[str | None, typer.Option("--dns", help="DNS servers, comma separated.")] = None,
+        prefix: Annotated[int | None, typer.Option("--prefix", help="Prefix length (overrides config).")] = None,
 ) -> None:
     """Apply a static IP to the configured connection."""
     st: State = ctx.obj
@@ -180,8 +182,8 @@ def dns_default(ctx: typer.Context) -> None:
 
 @dns_app.command("set")
 def dns_set(
-    ctx: typer.Context,
-    servers: Annotated[str, typer.Argument(help="Comma separated, e.g. 1.1.1.1,8.8.8.8")],
+        ctx: typer.Context,
+        servers: Annotated[str, typer.Argument(help="Comma separated, e.g. 1.1.1.1,8.8.8.8")],
 ) -> None:
     """Use specific DNS servers."""
     _change_dns(ctx.obj, _parse_dns(servers), "custom")
@@ -202,6 +204,59 @@ def restore(ctx: typer.Context) -> None:
     st: State = ctx.obj
     conn = applier.restore(dry_run=st.dry_run)
     _done(st, f"Restored original settings of '{conn}'")
+
+
+def _fmt(v: float | None, unit: str, digits: int = 1) -> str:
+    return "-" if v is None else f"{v:.{digits}f} {unit}"
+
+
+def _print_result(r: TestResult, deep: bool) -> None:
+    portal_style = {"open": "green", "portal": "yellow", "dead": "red"}[r.portal_state]
+    t = Table(show_header=False, box=None, pad_edge=False)
+    t.add_column(style="bold")
+    t.add_column()
+    t.add_row("IP", f"{r.ip}  (DNS: {r.dns_mode})")
+    t.add_row("MAC", r.mac or "-")
+    t.add_row("Gateway", "[green]reachable[/green]" if r.gateway_ok else "[red]unreachable[/red]")
+    t.add_row("Portal", f"[{portal_style}]{r.portal_state}[/{portal_style}]")
+    t.add_row("Ping", f"{_fmt(r.ping_avg_ms, 'ms')}  loss {_fmt(r.ping_loss_pct, '%', 0)}  jitter {_fmt(r.ping_jitter_ms, 'ms')}")
+    t.add_row("DNS", _fmt(r.dns_ms, "ms", 0))
+    t.add_row("Quick speed", _fmt(r.quick_mbps, "Mbps"))
+    if deep:
+        t.add_row("Sustained", f"avg {_fmt(r.sustained_avg_mbps, 'Mbps')}   min {_fmt(r.sustained_min_mbps, 'Mbps')}")
+        collapse = "none" if r.collapse_after_mb is None else f"after {r.collapse_after_mb:.1f} MB"
+        if r.sustained_avg_mbps is None:
+            collapse = "-"
+        t.add_row("Collapse", collapse)
+    t.add_row("Data used", f"{r.bytes_used / 1e6:.1f} MB")
+    t.add_row("Score", f"{r.score:.1f} / 100")
+    out.print(t)
+    if r.passed:
+        out.print("[bold green]PASS[/bold green]")
+    else:
+        out.print(f"[bold red]FAIL[/bold red]: {escape(r.fail_reason or 'unknown')}")
+    if not deep and r.passed:
+        err.print("[yellow]note:[/yellow] sustained test skipped; stability not verified")
+
+
+@app.command("test")
+def test_cmd(
+        ctx: typer.Context,
+        no_deep: Annotated[bool, typer.Option("--no-deep", help="Skip the sustained download test.")] = False,
+) -> None:
+    """Run the full test suite on the current IP."""
+    st: State = ctx.obj
+    cfg = st.load()
+    profile = netinfo.get_profile(cfg.network.interface, cfg.network.connection)
+    if not profile.ip:
+        raise NetError(f"'{profile.connection}' has no IPv4 address yet")
+    mode = nettests.detect_dns_mode(profile, cfg)
+    with out.status("Starting...") as status:
+        result = nettests.run_all(
+            cfg, profile.ip, mode, deep=not no_deep, profile=profile,
+            progress=lambda m: status.update(m),
+        )
+    _print_result(result, deep=not no_deep)
 
 
 def main() -> None:

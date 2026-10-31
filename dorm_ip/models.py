@@ -38,3 +38,12 @@ class TestResult:
     score: float  # 0-100
     passed: bool
     fail_reason: str | None
+
+
+@dataclass
+class SustainedResult:
+    avg_mbps: float
+    min_mbps: float
+    collapse_after_mb: float | None  # None = no collapse
+    bytes_used: int
+    duration: float  # seconds actually measured

@@ -44,6 +44,10 @@ class TestsCfg:
     sustained_seconds: int = 8
     sample_interval: float = 0.5
     data_budget_mb: int = 6000
+    sustained_url: str = ""  # optional: one long download; empty = repeat speed_url
+    dns_domains: list[str] = field(
+        default_factory=lambda: ["google.com", "cloudflare.com", "wikipedia.org"]
+    )
 
 
 @dataclass
@@ -239,11 +243,11 @@ def load_config(path: Path | None = None) -> Config:
 
 
 def with_overrides(
-    cfg: Config,
-    *,
-    ranges: list[str] | None = None,
-    gateway: str | None = None,
-    prefix: int | None = None,
+        cfg: Config,
+        *,
+        ranges: list[str] | None = None,
+        gateway: str | None = None,
+        prefix: int | None = None,
 ) -> Config:
     """Apply per-run CLI overrides and re-expand/validate."""
     net = cfg.network
