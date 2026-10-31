@@ -74,10 +74,22 @@ def env(cfg, monkeypatch):
 
     monkeypatch.setattr(netinfo, "get_profile", lambda i, c: PROFILE)
 
-    def fake_check(cfg_, profile, prober):
+    e.probe_flags = []
+    e.tunnel = None
+    e.busy_bytes = None
+    e.wall = [1000.0]
+    e.slow_probe = False
+
+    def fake_check(cfg_, profile, prober, probe=True):
+        e.probe_flags.append(probe)
+        if e.slow_probe:
+            return CheckResult(time.time(), profile.ip, profile.mac, True, 0.0, 20.0, 0.4, 200_000, False, "probe 0.4 Mbps")
         ok = e.healthy
         return CheckResult(time.time(), profile.ip, profile.mac, ok, 0.0 if ok else 100.0, 20.0,
-                           5.0 if ok else None, 200_000 if ok else 0, ok, "" if ok else "gateway unreachable")
+                           5.0 if ok and probe else None, 200_000 if ok and probe else 0, ok, "" if ok else "gateway unreachable")
+
+    monkeypatch.setattr(netinfo, "tunnel_device", lambda i: e.tunnel)
+    monkeypatch.setattr(netinfo, "iface_bytes", lambda d: e.busy_bytes)
 
     monkeypatch.setattr(watchdog, "run_check", fake_check)
     monkeypatch.setattr(nt, "check_portal", lambda c: e.portal)
@@ -104,14 +116,14 @@ def env(cfg, monkeypatch):
 
     e.make = lambda: watchdog.Watchdog(
         e.cfg, db=e.db, hunt=hunt, observer=e.obs, notify=e.notes_sent.append,
-        sleep=lambda s: None, clock=lambda: e.clock[0],
+        sleep=lambda s: None, clock=lambda: e.clock[0], wall=lambda: e.wall[0],
     )
     return e
 
 
 def test_healthy_checks_never_react(env):
     wd = env.make()
-    wd.run(max_checks=5)
+    wd.run(max_steps=5)
     assert env.hunts == 0 and wd.bad == 0 and env.db.conn.execute("SELECT COUNT(*) FROM checks").fetchone()[0] == 5
 
 
@@ -130,7 +142,7 @@ def test_consecutive_bad_checks_confirm_then_rehunt(env):
     env.hunt_result = TestResult(time.time(), "172.18.40.77", "aa", "override", False, True, "open", 20.0, 0.0, 1.0,
                                  10.0, 30.0, 20.0, 15.0, None, 1, 85.0, True, None)
     wd = env.make()
-    wd.run(max_checks=3)
+    wd.run(max_steps=3)
     assert env.hunts == 1 and wd.bad == 0
     assert any("degraded" in m.lower() for m in env.notes_sent)
     assert any("Switched to 172.18.40.77" in m for m in env.notes_sent)
@@ -142,28 +154,28 @@ def test_false_alarm_skips_hunt_and_holds_off(env):
     env.healthy = False
     env.confirm_pass = True
     wd = env.make()
-    wd.run(max_checks=3)
+    wd.run(max_steps=3)
     assert env.hunts == 0 and wd.bad == 0
     assert any("False alarm" in n for n in env.obs.notes)
     # still bad right away, but within the hold-off nothing re-runs the confirm test
     before = env.db.result_count()
-    wd.run(max_checks=6)
+    wd.run(max_steps=6)
     assert env.db.result_count() == before
     # after the hold-off it can confirm again
     env.clock[0] = 301
-    wd.run(max_checks=9)
+    wd.run(max_steps=9)
     assert env.db.result_count() == before + 1
 
 
 def test_failed_hunt_backs_off_exponentially(env):
     env.healthy = False
     wd = env.make()
-    wd.run(max_checks=3)
+    wd.run(max_steps=3)
     assert env.hunts == 1 and wd.hold_until == 300
-    wd.run(max_checks=8)  # still inside the cooldown
+    wd.run(max_steps=8)  # still inside the cooldown
     assert env.hunts == 1
     env.clock[0] = 301
-    wd.run(max_checks=9)
+    wd.run(max_steps=9)
     assert env.hunts == 2 and wd.hold_until == 301 + 600
 
 
@@ -181,7 +193,7 @@ def test_portal_relogin_instead_of_rehunt(env):
     env.portal = ("portal", 0, "http://p/")
     env.login_ok = True
     wd = env.make()
-    wd.run(max_checks=3)
+    wd.run(max_steps=3)
     assert env.logins == 1 and env.hunts == 0 and wd.bad == 0
     assert any("Logged in again" in n for n in env.obs.notes)
 
@@ -190,7 +202,7 @@ def test_portal_login_unavailable_falls_through_to_rehunt(env):
     env.healthy = False
     env.portal = ("portal", 0, "http://p/")
     wd = env.make()
-    wd.run(max_checks=3)
+    wd.run(max_steps=3)
     assert env.logins == 1 and env.hunts == 1  # no confirm test while the portal blocks
 
 
@@ -198,7 +210,7 @@ def test_budget_exhausted_skips_rehunt(env):
     env.db.add_bytes(env.cfg.tests.data_budget_mb * 1_000_000)
     env.healthy = False
     wd = env.make()
-    wd.run(max_checks=3)
+    wd.run(max_steps=3)
     assert env.hunts == 0 and any("budget" in m for m in env.notes_sent)
 
 
@@ -209,24 +221,120 @@ def test_hunt_error_is_survivable(env):
         raise NetError("no active wifi")
 
     wd = watchdog.Watchdog(env.cfg, db=env.db, hunt=boom, observer=env.obs, notify=env.notes_sent.append,
-                           sleep=lambda s: None, clock=lambda: env.clock[0])
-    wd.run(max_checks=3)
+                           sleep=lambda s: None, clock=lambda: env.clock[0], wall=lambda: env.wall[0])
+    wd.run(max_steps=3)
     assert wd.hunt_failures == 1 and any("Re-hunt error" in n for n in env.obs.notes)
 
 
-def test_wifi_down_counts_as_bad_check(env, monkeypatch):
+def test_wifi_down_pauses_instead_of_counting(env, monkeypatch):
     def down(i, c):
         raise NetError("no active wifi connection")
 
     monkeypatch.setattr(netinfo, "get_profile", down)
     wd = env.make()
+    for _ in range(6):
+        assert wd.step() is None
+    assert wd.bad == 0 and env.hunts == 0 and env.db.conn.execute("SELECT COUNT(*) FROM checks").fetchone()[0] == 0
+    assert sum("Paused" in n for n in env.obs.notes) == 1  # announced once, not every check
+
+
+def test_other_network_never_triggers_rehunt(env, monkeypatch):
+    other = NetProfile("wlan0", "HomeWifi", "auto", "192.168.1.20", 24, "192.168.1.1", ["1.1.1.1"], "aa")
+    monkeypatch.setattr(netinfo, "get_profile", lambda i, c: other)
+    env.healthy = False
+    wd = env.make()
+    wd.run(max_steps=8)
+    assert env.hunts == 0 and wd.bad == 0 and any("does not look like the dorm wifi" in n for n in env.obs.notes)
+
+
+def test_resumes_when_back_on_dorm_wifi(env, monkeypatch):
+    seq = [None, PROFILE]
+
+    def prof(i, c):
+        p = seq[0] if len(seq) > 1 else seq[0]
+        if p is None:
+            raise NetError("no wifi")
+        return p
+
+    monkeypatch.setattr(netinfo, "get_profile", prof)
+    wd = env.make()
+    wd.step()
+    seq.pop(0)
+    wd.step()
+    assert any("Resumed: connected" in n for n in env.obs.notes) and wd.checks == 1
+
+
+def test_vpn_means_gateway_only_and_no_rehunt(env):
+    env.tunnel = "tun0"
+    wd = env.make()
+    wd.run(max_steps=3)
+    assert env.probe_flags == [False, False, False]
+    assert any("VPN" in n for n in env.obs.notes)
+    # now the gateway really dies while the VPN is up: notify, but never re-hunt
+    env.healthy = False
+    wd.run(max_steps=8)
+    assert env.hunts == 0 and any("not re-hunting" in n for n in env.obs.notes)
+
+
+def test_vpn_gone_resumes_full_checks(env):
+    env.tunnel = "wg0"
+    wd = env.make()
+    wd.step()
+    env.tunnel = None
+    wd.step()
+    assert env.probe_flags == [False, True] and any("VPN/tunnel is gone" in n for n in env.obs.notes)
+
+
+def test_suspend_resume_gets_a_grace_period(env):
+    wd = env.make()
+    wd.step()
+    env.healthy = False
+    env.wall[0] += 3600  # laptop slept for an hour
+    for _ in range(3):  # 3 x 15 s, all inside the 60 s grace period
+        env.wall[0] += 15
+        wd.step()
+    assert env.hunts == 0 and wd.bad == 0 and any("Resumed after" in n for n in env.obs.notes)
+    # after the grace period real failures count again
+    env.wall[0] += 30  # grace over, and a normal gap between checks
+    wd.step()
+    assert wd.bad == 1
+
+
+def test_slow_probe_ignored_when_link_is_busy(env):
+    wd = env.make()
+    env.busy_bytes = 0
+    wd.step()  # baseline counters
+    env.slow_probe = True
+    env.wall[0] += 30
+    env.busy_bytes = 30 * 1_000_000  # ~8 Mbps of the user's own traffic over 30 s
     c = wd.step()
-    assert not c.ok and c.note == "wifi not connected" and wd.bad == 1
+    assert c.ok and "link busy" in c.note and wd.bad == 0
+
+
+def test_slow_probe_counts_when_link_is_idle(env):
+    wd = env.make()
+    env.busy_bytes = 0
+    wd.step()
+    env.slow_probe = True
+    env.wall[0] += 30
+    env.busy_bytes = 10_000
+    assert not wd.step().ok and wd.bad == 1
+
+
+def test_busy_rule_can_be_disabled(env):
+    env.cfg = replace(env.cfg, watchdog=replace(env.cfg.watchdog, busy_mbps=0))
+    wd = env.make()
+    env.busy_bytes = 0
+    wd.step()
+    env.slow_probe = True
+    env.wall[0] += 30
+    env.busy_bytes = 50_000_000
+    assert not wd.step().ok
 
 
 def test_checks_logged_and_counted(env):
     wd = env.make()
-    wd.run(max_checks=4)
+    wd.run(max_steps=4)
     assert env.db.daily_bytes() == 4 * 200_000
 
 

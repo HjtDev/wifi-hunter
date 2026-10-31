@@ -209,3 +209,45 @@ def check_profile(p: NetProfile, cfg: Config) -> list[str]:
     if p.gateway and p.gateway != n.gateway:
         warnings.append(f"live gateway {p.gateway} differs from config gateway {n.gateway}.")
     return warnings
+
+
+# ---------------------------------------------------------------- safety checks
+
+_RE_DEV = re.compile(r"\bdev\s+(\S+)")
+
+
+def egress_device(target: str = "1.1.1.1") -> str | None:
+    """Device the kernel would use to reach `target` (policy routing aware), or None if unknown."""
+    try:
+        text = run(["ip", "-4", "route", "get", target], timeout=5)
+    except NetError:
+        return None
+    m = _RE_DEV.search(text)
+    return m.group(1) if m else None
+
+
+def tunnel_device(interface: str) -> str | None:
+    """Name of the VPN/tunnel device carrying internet traffic instead of `interface`, else None."""
+    if not interface:
+        return None
+    dev = egress_device()
+    return dev if dev and dev != interface else None
+
+
+def check_dorm_network(p: NetProfile, cfg: Config) -> str | None:
+    """A message if we are clearly connected to some other network (gateway mismatch)."""
+    if p.gateway and p.gateway != cfg.network.gateway:
+        return (
+            f"the connected network's gateway is {p.gateway}, but the config expects "
+            f"{cfg.network.gateway}: this does not look like the dorm wifi"
+        )
+    return None
+
+
+def iface_bytes(device: str) -> int | None:
+    """rx+tx byte counters of a network device (None if unavailable)."""
+    base = Path(f"/sys/class/net/{device}/statistics")
+    try:
+        return int((base / "rx_bytes").read_text()) + int((base / "tx_bytes").read_text())
+    except (OSError, ValueError):
+        return None

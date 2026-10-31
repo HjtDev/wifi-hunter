@@ -125,3 +125,59 @@ def test_disabled_or_none_is_false(creds):
 def test_secrets_never_in_reason(creds):
     ok, detail = portal.login_detail(pcfg(creds), client=client(lambda r: httpx.Response(500, text="p@ss{word}&x")))
     assert "p@ss" not in detail and "u123" not in detail
+
+
+# ---- resolving through the dorm DNS
+def test_resolving_transport_connects_to_ip_but_keeps_name():
+    seen = {}
+
+    def handler(req):
+        seen["url"], seen["host"], seen["sni"] = str(req.url), req.headers["host"], req.extensions.get("sni_hostname")
+        return httpx.Response(200)
+
+    tr = portal.ResolvingTransport(httpx.MockTransport(handler), lambda h: "172.18.32.50")
+    with httpx.Client(transport=tr) as c:
+        c.get("https://portal.dorm.local/login?a=1")
+    assert seen == {"url": "https://172.18.32.50/login?a=1", "host": "portal.dorm.local", "sni": "portal.dorm.local"}
+
+
+def test_resolving_transport_caches_and_falls_back():
+    calls = []
+
+    def resolver(h):
+        calls.append(h)
+        return None
+
+    urls = []
+    tr = portal.ResolvingTransport(httpx.MockTransport(lambda r: urls.append(str(r.url)) or httpx.Response(200)), resolver)
+    with httpx.Client(transport=tr) as c:
+        c.get("http://portal.dorm.local/a")
+        c.get("http://portal.dorm.local/b")
+        c.get("http://10.0.0.1/c")  # IP literals are never resolved
+    assert calls == ["portal.dorm.local"] and urls[0] == "http://portal.dorm.local/a" and urls[2] == "http://10.0.0.1/c"
+
+
+def test_login_uses_dorm_dns_for_the_portal_host(creds, monkeypatch):
+    asked = []
+    monkeypatch.setattr(portal.dnsq, "resolve_via", lambda servers, host, timeout=2.0: asked.append((servers, host)) or "172.18.32.50")
+    seen = {}
+    monkeypatch.setattr(
+        portal.httpx, "HTTPTransport",
+        lambda verify=True: httpx.MockTransport(lambda r: seen.update(url=str(r.url), host=r.headers["host"]) or httpx.Response(200, text="ok")),
+    )
+    ok, _ = portal.login_detail(pcfg(creds, url="http://portal.dorm.local/login"), dorm_dns=["172.18.32.1"])
+    assert ok and asked == [(["172.18.32.1"], "portal.dorm.local")]
+    assert seen == {"url": "http://172.18.32.50/login", "host": "portal.dorm.local"}
+
+
+def test_host_ip_overrides_dns_and_dns_can_be_disabled(creds, monkeypatch):
+    monkeypatch.setattr(portal.dnsq, "resolve_via", lambda *a, **k: pytest.fail("DNS must not be asked"))
+    seen = {}
+    monkeypatch.setattr(
+        portal.httpx, "HTTPTransport",
+        lambda verify=True: httpx.MockTransport(lambda r: seen.update(url=str(r.url)) or httpx.Response(200)),
+    )
+    portal.login_detail(pcfg(creds, url="http://portal.dorm.local/x", host_ip="10.9.9.9"), dorm_dns=["172.18.32.1"])
+    assert seen["url"] == "http://10.9.9.9/x"
+    portal.login_detail(pcfg(creds, url="http://portal.dorm.local/x", resolve_via_dorm_dns=False), dorm_dns=["172.18.32.1"])
+    assert seen["url"] == "http://portal.dorm.local/x"

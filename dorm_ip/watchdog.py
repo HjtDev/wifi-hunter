@@ -16,6 +16,7 @@ from .models import CheckResult, NetProfile, TestResult
 from .netinfo import NetError
 
 MAX_COOLDOWN = 1800.0
+RESUME_GRACE = 60.0  # seconds of ignored checks after a suspend/resume
 GATEWAY_PINGS = 3
 
 
@@ -74,24 +75,26 @@ class Prober:
         return total * 8 / max(elapsed, 1e-6) / 1e6, total
 
 
-def evaluate(cfg: Config, loss: float | None, mbps: float | None) -> tuple[bool, str]:
+def evaluate(cfg: Config, loss: float | None, mbps: float | None, probe: bool = True) -> tuple[bool, str]:
+    """probe=False (VPN active): only the gateway ping counts."""
     reasons: list[str] = []
     if loss is None or loss >= 100:
         reasons.append("gateway unreachable")
     elif loss > cfg.thresholds.max_loss_pct:
         reasons.append(f"loss {loss:.0f}%")
-    if mbps is None:
-        reasons.append("probe failed")
-    elif mbps < cfg.watchdog.min_probe_mbps:
-        reasons.append(f"probe {mbps:.1f} Mbps")
+    if probe:
+        if mbps is None:
+            reasons.append("probe failed")
+        elif mbps < cfg.watchdog.min_probe_mbps:
+            reasons.append(f"probe {mbps:.1f} Mbps")
     return not reasons, ", ".join(reasons)
 
 
-def run_check(cfg: Config, profile: NetProfile, prober: Prober) -> CheckResult:
-    """Gateway ping, then (only if the gateway answers) the download probe."""
+def run_check(cfg: Config, profile: NetProfile, prober: Prober, probe: bool = True) -> CheckResult:
+    """Gateway ping, then (only if the gateway answers and no VPN is active) the download probe."""
     rtt, loss, _jit = nettests.ping(cfg.network.gateway, GATEWAY_PINGS, wait=1)
-    mbps, nbytes = (None, 0) if loss is None or loss >= 100 else prober.probe()
-    ok, note = evaluate(cfg, loss, mbps)
+    mbps, nbytes = (None, 0) if not probe or loss is None or loss >= 100 else prober.probe()
+    ok, note = evaluate(cfg, loss, mbps, probe)
     return CheckResult(
         ts=time.time(), ip=profile.ip or "", mac=profile.mac, gateway_ok=loss is not None and loss < 100,
         loss_pct=loss, rtt_ms=rtt, probe_mbps=mbps, bytes_used=nbytes, ok=ok, note=note,
@@ -112,16 +115,20 @@ def send_notification(message: str) -> None:
 # ---------------------------------------------------------------- watchdog
 
 class Watchdog:
+    """Never judges the link while it cannot be judged: wifi down, another network, a VPN carrying
+    the traffic, just resumed from suspend, or the link busy with your own traffic."""
+
     def __init__(
-        self,
-        cfg: Config,
-        *,
-        db,  # dorm_ip.db.DB (save, save_check, daily_bytes)
-        hunt: Callable[[], TestResult | None],
-        observer: WatchObserver | None = None,
-        notify: Callable[[str], None] | None = None,
-        sleep: Callable[[float], None] = time.sleep,
-        clock: Callable[[], float] = time.monotonic,
+            self,
+            cfg: Config,
+            *,
+            db,  # dorm_ip.db.DB (save, save_check, daily_bytes)
+            hunt: Callable[[], TestResult | None],
+            observer: WatchObserver | None = None,
+            notify: Callable[[str], None] | None = None,
+            sleep: Callable[[float], None] = time.sleep,
+            clock: Callable[[], float] = time.monotonic,
+            wall: Callable[[], float] = time.time,
     ) -> None:
         self.cfg = cfg
         self.db = db
@@ -130,20 +137,29 @@ class Watchdog:
         self.notify = notify or (send_notification if cfg.watchdog.notify else (lambda _m: None))
         self.sleep = sleep
         self.clock = clock
+        self.wall = wall
         self.prober = Prober(cfg)
         self.bad = 0
         self.hunt_failures = 0
         self.hold_until = 0.0  # no confirm/re-hunt before this (monotonic time)
         self.budget_warned = False
+        self.steps = 0
         self.checks = 0
         self.rehunts = 0
+        self.last_wall: float | None = None
+        self.grace_until = 0.0  # wall time
+        self.paused: str | None = None  # why checks are paused (wifi down / other network)
+        self.tunnel: str | None = None  # VPN device while one carries the traffic
+        self.last_bytes: tuple[float, int] | None = None  # (wall, rx+tx) for the busy estimate
+        self.busy: float | None = None  # Mbps on the wifi interface since the previous check
 
     # -- main loop
-    def run(self, max_checks: int | None = None) -> None:
+    def run(self, max_steps: int | None = None, max_checks: int | None = None) -> None:
+        limit = max_steps if max_steps is not None else max_checks
         try:
             while True:
                 self.step()
-                if max_checks is not None and self.checks >= max_checks:
+                if limit is not None and self.steps >= limit:
                     return
                 self.sleep(self.cfg.watchdog.interval_seconds)
         finally:
@@ -155,15 +171,74 @@ class Watchdog:
         except NetError:
             return None
 
-    def step(self) -> CheckResult:
+    def _pause(self, reason: str) -> None:
+        self.bad = 0
+        self.last_bytes = None
+        if self.paused != reason:
+            self.paused = reason
+            self.obs.note(f"Paused: {reason}")
+
+    def _busy_mbps(self, profile: NetProfile) -> float | None:
+        total = netinfo.iface_bytes(profile.interface)
+        now = self.wall()
+        prev, self.last_bytes = self.last_bytes, (now, total) if total is not None else None
+        if prev is None or total is None or now <= prev[0]:
+            return None
+        return max(0.0, (total - prev[1]) * 8 / (now - prev[0]) / 1e6)
+
+    def _ignore_slow_probe_if_busy(self, c: CheckResult) -> CheckResult:
+        """A slow probe while *you* are using the link is not the IP's fault."""
+        limit = self.cfg.watchdog.busy_mbps
+        only_slow = (
+                not c.ok and c.gateway_ok and c.probe_mbps is not None
+                and c.loss_pct is not None and c.loss_pct <= self.cfg.thresholds.max_loss_pct
+        )
+        if limit > 0 and only_slow and self.busy is not None and self.busy >= limit:
+            c.ok = True
+            c.note = f"slow probe ignored: link busy ({self.busy:.1f} Mbps of your own traffic)"
+        return c
+
+    def step(self) -> CheckResult | None:
+        self.steps += 1
+        interval = self.cfg.watchdog.interval_seconds
+        wall = self.wall()
+        if self.last_wall is not None and wall - self.last_wall > 3 * interval + 10:
+            self.bad = 0
+            self.last_bytes = None
+            self.grace_until = wall + RESUME_GRACE
+            self.obs.note(
+                f"Resumed after {wall - self.last_wall:.0f}s without checks (suspend?); "
+                f"ignoring checks for {RESUME_GRACE:.0f}s while the wifi reconnects"
+            )
+        self.last_wall = wall
+        if wall < self.grace_until:
+            return None
+
         profile = self._profile()
         if profile is None or not profile.ip:
-            c = CheckResult(
-                ts=time.time(), ip="", mac="", gateway_ok=False, loss_pct=None, rtt_ms=None,
-                probe_mbps=None, bytes_used=0, ok=False, note="wifi not connected",
+            self._pause("wifi not connected")
+            return None
+        other = netinfo.check_dorm_network(profile, self.cfg)
+        if other:
+            self._pause(other)
+            return None
+        if self.paused:
+            self.obs.note("Resumed: connected to the dorm wifi again")
+            self.paused = None
+
+        tun = netinfo.tunnel_device(profile.interface)
+        if tun != self.tunnel:
+            self.tunnel = tun
+            self.bad = 0
+            self.obs.note(
+                f"VPN/tunnel '{tun}' is carrying your traffic: checking the gateway only, no downloads, no re-hunts"
+                if tun else "VPN/tunnel is gone: full checks resumed"
             )
-        else:
-            c = run_check(self.cfg, profile, self.prober)
+
+        self.busy = self._busy_mbps(profile)
+        c = run_check(self.cfg, profile, self.prober, probe=tun is None)
+        if tun is None:
+            c = self._ignore_slow_probe_if_busy(c)
         self.checks += 1
         self.db.save_check(c)
         self.bad = 0 if c.ok else self.bad + 1
@@ -180,6 +255,12 @@ class Watchdog:
             return  # recently handled (false alarm or failed re-hunt); keep logging only
         ip = profile.ip if profile and profile.ip else ""
         mac = profile.mac if profile else ""
+        if self.tunnel:
+            # Tests and a re-hunt would measure (and reconnect) the VPN, not the dorm link.
+            self.obs.note(f"Gateway problem ({c.note}) while VPN '{self.tunnel}' is active: not re-hunting")
+            self.notify(f"Gateway problem while VPN is active ({c.note}); not re-hunting")
+            self.hold_until = now + self.cfg.watchdog.rehunt_cooldown_seconds
+            return
         self.notify(f"Connection degraded on {ip or 'wifi'}: {c.note}")
         self.obs.note(f"Degraded for {self.bad} checks ({c.note})")
 
@@ -210,7 +291,7 @@ class Watchdog:
             self.obs.note(f"Confirmed: {r.fail_reason}")
 
         # 3. Re-hunt (unless today's data budget is gone).
-        budget = self.cfg.tests.data_budget_mb * 1_000_000
+        budget = self.cfg.tests.budget_bytes()
         if self.db.daily_bytes() >= budget:
             if not self.budget_warned:
                 self.notify("Daily data budget reached; not re-hunting")
