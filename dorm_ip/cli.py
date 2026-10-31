@@ -2,8 +2,11 @@
 
 import ipaddress
 import shutil
+import signal
+import sqlite3
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -13,9 +16,10 @@ from rich.live import Live
 from rich.markup import escape
 from rich.table import Table
 
-from . import applier, hunter, netinfo, scanner
+from . import applier, hunter, netinfo, portal, scanner, watchdog
 from . import tests as nettests
 from .config import Config, ConfigError, load_config, with_overrides
+from .db import DB, IpStats, open_db
 from .models import TestResult
 from .netinfo import NetError
 
@@ -239,6 +243,8 @@ def test_cmd(
             cfg, profile.ip, mode, deep=not no_deep, profile=profile,
             progress=lambda m: status.update(m),
         )
+    with open_db() as d:
+        d.save(result)
     _print_result(result, deep=not no_deep)
 
 
@@ -372,14 +378,21 @@ def hunt_cmd(
     cfg = st.load()
     if ranges or max_ is not None or order:
         cfg = with_overrides(cfg, ranges=ranges, max_candidates=max_, order=order)
-    if cfg.hunt.order == "best-history":
-        err.print("[yellow]note:[/yellow] no history yet (phase 4); best-history falls back to random order")
-
     obs = LiveHunt()
+    d: DB | None = None if st.dry_run else open_db()
     try:
-        result = hunter.hunt(cfg, observer=obs, dry_run=st.dry_run)
+        history = d.scores() if d is not None and cfg.hunt.order == "best-history" else None
+        if cfg.hunt.order == "best-history" and not history:
+            err.print("[yellow]note:[/yellow] no history yet; best-history falls back to random order")
+        result = hunter.hunt(
+            cfg, observer=obs, dry_run=st.dry_run, history=history,
+            spent=d.daily_bytes if d else None, save=d.save if d else None,
+        )
+        used_today = d.daily_bytes() if d else 0
     finally:
         obs.close()
+        if d is not None:
+            d.close()
 
     if st.dry_run:
         out.print("[dry-run] no tests were run and nothing was changed", markup=False)
@@ -390,6 +403,7 @@ def hunt_cmd(
 
     out.print()
     _print_result(result, deep=True)
+    out.print(f"Data used today: {used_today / 1e6:.0f} MB of {cfg.tests.data_budget_mb} MB budget")
     f = obs.final
     if f is None:
         return
@@ -404,11 +418,184 @@ def hunt_cmd(
         err.print("[yellow]warning:[/yellow] portal check failed after finalizing DNS")
 
 
+def _hour_ranges(hours: list[int]) -> str:
+    """[20, 21, 22, 23, 1] -> '1, 20-23'"""
+    if not hours:
+        return "-"
+    hours = sorted(set(hours))
+    groups, start, prev = [], hours[0], hours[0]
+    for h in hours[1:]:
+        if h == prev + 1:
+            prev = h
+            continue
+        groups.append((start, prev))
+        start = prev = h
+    groups.append((start, prev))
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in groups)
+
+
+BARS = "▁▂▃▄▅▆▇█"
+
+
+def _hour_chart(hours: dict[int, tuple[int, int]]) -> tuple[str, str]:
+    ruler = "".join(str(h % 10) for h in range(24))
+    bars = ""
+    for h in range(24):
+        n, p = hours.get(h, (0, 0))
+        bars += "·" if n == 0 else BARS[round(p / n * (len(BARS) - 1))]
+    return ruler, bars
+
+
+def _stats_row(rank: int, s: IpStats) -> tuple[str, ...]:
+    flag = {"bad": "[red]bad[/red]", "flaky": "[yellow]flaky[/yellow]"}.get(s.flag, "")
+    return (
+        str(rank), s.ip, str(s.tests), f"{s.pass_rate * 100:.0f}%",
+        "-" if s.avg_score is None else f"{s.avg_score:.0f}",
+        "-" if s.avg_sustained is None else f"{s.avg_sustained:.1f}",
+        _hour_ranges(s.good_hours), datetime.fromtimestamp(s.last_ts).strftime("%m-%d %H:%M"), flag,
+    )
+
+
+@app.command()
+def history(
+        ctx: typer.Context,
+        top: Annotated[int, typer.Option("--top", help="How many best IPs to show.")] = 10,
+) -> None:
+    """Best IPs from past tests, when they were good (hour of day), and IPs that often fail."""
+    st: State = ctx.obj
+    cfg = st.load()
+    with open_db() as d:
+        stats = d.ip_stats()
+        if not stats:
+            out.print("No results yet. Run `dorm-ip test` or `dorm-ip hunt` first.")
+            return
+        ranked = sorted(stats, key=lambda s: (-s.eff_score, -s.tests))[:top]
+        t = Table(box=None, pad_edge=False)
+        for col in ("#", "IP", "Tests", "Pass", "Score", "Sust Mbps", "Good hours", "Last", "Flag"):
+            t.add_column(col)
+        for i, s in enumerate(ranked, 1):
+            t.add_row(*_stats_row(i, s))
+        out.print(t)
+
+        bad = sorted((s for s in stats if s.flag), key=lambda s: (s.passes / s.tests, -s.tests))
+        if bad:
+            shown = ", ".join(f"{s.ip} ({s.passes}/{s.tests})" for s in bad[:15])
+            out.print(f"\nOften fail (passes/tests): {shown}" + (" ..." if len(bad) > 15 else ""), markup=False, highlight=False)
+
+        ruler, bars = _hour_chart(d.hour_stats())
+        out.print(f"\nHour of day  {ruler}\nPass rate    {bars}", markup=False, highlight=False)
+
+        seen = d.seen_stats()
+        parts = []
+        for flag, label in ((False, "unused IPs"), (True, "IPs seen in use")):
+            if flag in seen and seen[flag][0]:
+                n, p = seen[flag]
+                parts.append(f"{label}: {p / n * 100:.0f}% pass ({n} tests)")
+        if parts:
+            out.print("By scan: " + "   ".join(parts), markup=False, highlight=False)
+        out.print(
+            f"Data used today: {d.daily_bytes() / 1e6:.0f} MB of {cfg.tests.data_budget_mb} MB budget",
+            markup=False, highlight=False,
+        )
+
+
+class PrintWatch(watchdog.WatchObserver):
+    def check(self, c, bad_streak: int, limit: int) -> None:  # type: ignore[override]
+        ts = datetime.fromtimestamp(c.ts).strftime("%H:%M:%S")
+        status = "[green]ok[/green]" if c.ok else f"[red]BAD {bad_streak}/{limit}[/red]"
+        line = (
+            f"{ts}  {escape(c.ip or '-'):<15}  gw {_fmt(c.rtt_ms, 'ms', 0)}  loss {_fmt(c.loss_pct, '%', 0)}"
+            f"  probe {_fmt(c.probe_mbps, 'Mbps')}  {status}"
+        )
+        if c.note:
+            line += f"  {escape(c.note)}"
+        out.print(line)
+
+    def note(self, text: str) -> None:
+        out.print(f"[yellow]{escape(text)}[/yellow]")
+
+
+@app.command()
+def watch(
+        ctx: typer.Context,
+        notify: Annotated[
+            bool | None, typer.Option("--notify/--no-notify", help="Desktop notifications (default: from config).")
+        ] = None,
+) -> None:
+    """Watch the connection and re-hunt automatically when it degrades."""
+    st: State = ctx.obj
+    cfg = st.load()
+    if notify is not None:
+        cfg = replace(cfg, watchdog=replace(cfg.watchdog, notify=notify))
+    w = cfg.watchdog
+    per_day = w.probe_bytes * 86400 / w.interval_seconds / 1e6
+    out.print(
+        f"Watching every {w.interval_seconds:g}s; re-hunt after {w.bad_checks_to_rehunt} bad checks. "
+        f"Probe traffic is about {per_day:.0f} MB/day (budget {cfg.tests.data_budget_mb} MB/day). Ctrl+C to stop.",
+        markup=False, highlight=False,
+    )
+
+    def on_term(signum, frame):  # noqa: ARG001
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, on_term)
+    with open_db() as d:
+
+        def do_hunt():
+            obs = LiveHunt()
+            try:
+                history = d.scores() if cfg.hunt.order == "best-history" else None
+                return hunter.hunt(
+                    cfg, observer=obs, dry_run=st.dry_run, history=history, spent=d.daily_bytes, save=d.save
+                )
+            finally:
+                obs.close()
+
+        wd = watchdog.Watchdog(cfg, db=d, hunt=do_hunt, observer=PrintWatch())
+        try:
+            wd.run()
+        except KeyboardInterrupt:
+            out.print(f"\nStopped after {wd.checks} checks, {wd.rehunts} re-hunt(s). The current IP was left as is.")
+
+
+@app.command()
+def login(
+        ctx: typer.Context,
+        force: Annotated[bool, typer.Option("--force", help="Log in even if the portal already looks open.")] = False,
+) -> None:
+    """Replay the portal login request configured in the portal section of config.toml."""
+    st: State = ctx.obj
+    cfg = st.load()
+    if st.dry_run:
+        p = cfg.portal
+        out.print(
+            f"[dry-run] would send {p.method} {p.url} with fields: {', '.join(p.fields) or '(none)'}",
+            markup=False, highlight=False,
+        )
+        return
+    profile = netinfo.get_profile(cfg.network.interface, cfg.network.connection)
+    state, _b, _loc = nettests.check_portal(cfg)
+    out.print(f"Portal state: {state}")
+    if state == "open" and not force:
+        out.print("Already open; nothing to do (use --force to log in anyway).")
+        return
+    ok, detail = portal.login_detail(cfg.portal, ip=profile.ip or "", mac=profile.mac)
+    out.print(("Login request sent: " if ok else "[red]Login failed:[/red] ") + escape(detail))
+    state = nettests.check_portal(cfg)[0]
+    out.print(f"Portal state now: {state}")
+    if not ok or state != "open":
+        raise SystemExit(1)
+
+
+
 def main() -> None:
     try:
         app()
     except (ConfigError, NetError) as e:
         err.print(f"[red]error:[/red] {escape(str(e))}")
+        raise SystemExit(1) from None
+    except sqlite3.Error as e:
+        err.print(f"[red]database error:[/red] {escape(str(e))}")
         raise SystemExit(1) from None
     except KeyboardInterrupt:
         err.print("\n[yellow]Interrupted.[/yellow]")

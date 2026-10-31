@@ -165,7 +165,7 @@ def dns_time(servers: list[str], domains: list[str]) -> float | None:
 # ---------------------------------------------------------------- sustained
 
 def analyze_samples(
-    samples: list[tuple[float, int]], collapse_below_mbps: float
+        samples: list[tuple[float, int]], collapse_below_mbps: float
 ) -> SustainedResult:
     """samples = [(seconds, cumulative_bytes)], starting at (0, 0).
 
@@ -260,14 +260,15 @@ def detect_dns_mode(profile: NetProfile, cfg: Config) -> str:
 
 
 def run_all(
-    cfg: Config,
-    ip: str,
-    dns_mode: str,
-    deep: bool = True,
-    *,
-    seen_in_use: bool = False,
-    profile: NetProfile | None = None,
-    progress: Progress | None = None,
+        cfg: Config,
+        ip: str,
+        dns_mode: str,
+        deep: bool = True,
+        *,
+        seen_in_use: bool = False,
+        profile: NetProfile | None = None,
+        progress: Progress | None = None,
+        on_portal: Callable[[], bool] | None = None,
 ) -> TestResult:
     """Run the suite in order and stop at the first failure. bytes_used counts HTTP
     payload only (ping/DNS traffic is negligible)."""
@@ -300,6 +301,11 @@ def run_all(
     say("Portal / connectivity check")
     r.portal_state, nbytes, _loc = check_portal(cfg)
     r.bytes_used += nbytes
+    if r.portal_state == "portal" and on_portal is not None:
+        say("Portal: logging in")
+        if on_portal():
+            r.portal_state, nbytes, _loc = check_portal(cfg)
+            r.bytes_used += nbytes
     if failed():
         return finish()
 

@@ -56,17 +56,17 @@ def _sigterm_as_interrupt() -> Iterator[None]:
         signal.signal(signal.SIGTERM, old)
 
 
-def try_login(cfg: Config) -> bool:
-    """Single plug-in point for phase 6 auto-login (stub returns False)."""
-    return portal.login(None)
+def try_login(cfg: Config, ip: str = "", mac: str = "") -> bool:
+    """Single plug-in point for portal auto-login (False when [portal] is not enabled)."""
+    return portal.login(cfg.portal, ip=ip, mac=mac)
 
 
 def finalize(
-    cfg: Config,
-    r: TestResult,
-    target: applier.Target,
-    *,
-    sleep: Callable[[float], None] = time.sleep,
+        cfg: Config,
+        r: TestResult,
+        target: applier.Target,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
 ) -> Finalized:
     """Leave the passing IP on the DNS chosen by dns.final_mode and report the portal state.
 
@@ -94,7 +94,7 @@ def finalize(
     elif current != mode:
         switch(mode)
 
-    if state == "portal" and try_login(cfg):
+    if state == "portal" and try_login(cfg, r.ip, r.mac):
         state, _b, url = nettests.check_portal(cfg)
     if state == "portal" and url is None:
         url = cfg.tests.connectivity_url
@@ -122,15 +122,15 @@ def _scan(cfg: Config, target: applier.Target, obs: HuntObserver, dry_run: bool)
 
 
 def hunt(
-    cfg: Config,
-    *,
-    observer: HuntObserver | None = None,
-    dry_run: bool = False,
-    spent: Callable[[], int] | None = None,
-    save: Callable[[TestResult], None] | None = None,
-    history: dict[str, float] | None = None,
-    sleep: Callable[[float], None] = time.sleep,
-    rng: random.Random | None = None,
+        cfg: Config,
+        *,
+        observer: HuntObserver | None = None,
+        dry_run: bool = False,
+        spent: Callable[[], int] | None = None,
+        save: Callable[[TestResult], None] | None = None,
+        history: dict[str, float] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        rng: random.Random | None = None,
 ) -> TestResult | None:
     """Try candidates until one passes. Returns the passing result, or None.
 
@@ -186,9 +186,12 @@ def hunt(
                 )
 
                 def run_tests(ip: str = ip, profile: NetProfile = profile) -> TestResult:
+                    login_hook = None
+                    if cfg.portal.enabled and cfg.portal.login_during_hunt:
+                        login_hook = lambda: try_login(cfg, ip, profile.mac)  # noqa: E731
                     return nettests.run_all(
                         cfg, ip, dns_mode, deep=True, seen_in_use=ip in used, profile=profile,
-                        progress=lambda m: obs.stage(ip, m),
+                        progress=lambda m: obs.stage(ip, m), on_portal=login_hook,
                     )
 
                 sleep(cfg.hunt.settle_seconds)

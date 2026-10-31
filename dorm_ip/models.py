@@ -47,3 +47,19 @@ class SustainedResult:
     collapse_after_mb: float | None  # None = no collapse
     bytes_used: int
     duration: float  # seconds actually measured
+
+
+@dataclass
+class CheckResult:
+    """One watchdog check of the live connection."""
+
+    ts: float
+    ip: str
+    mac: str
+    gateway_ok: bool
+    loss_pct: float | None
+    rtt_ms: float | None
+    probe_mbps: float | None
+    bytes_used: int
+    ok: bool
+    note: str
