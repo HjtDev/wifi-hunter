@@ -133,3 +133,23 @@ Decisions made where the spec was ambiguous (simplest option chosen).
   as 1 MB/s = 8 Mbps for both quick and sustained; `order = "best-history"`; `final_mode = "override"`;
   watchdog `interval_seconds = 30`.
 - `data_budget_mb = 0` means unlimited.
+
+## Roadmap phase 1 (live switching, readiness polling, smart ordering)
+- `applier.switch_static(live=True)`: `nmcli device modify <dev> ipv4.*` (runtime only, saved profile untouched), then
+  `nmcli dev show` must list exactly the new address; otherwise (nmcli error, address unchanged, or an extra address next to
+  the old one) it falls back to `con mod` + `con up` and returns a note. The hunter turns live switching off for the rest of
+  the run after the first fallback. The winner is written to the profile with `persist_static` (`con mod`, no reconnect).
+  Restore after a failed/interrupted hunt is still `con mod` (saved values) + `con up`.
+- This cannot be tested without real NetworkManager/wifi, hence the read-back check and `dorm-ip live-check`
+  (switches to a known-good IP live, optionally by reconnect too, always restores the original profile).
+- `_wait_ready` polls the gateway (1 ping, 0.2 s apart) instead of sleeping `settle_seconds`; live: max `settle_seconds`,
+  reconnect: max `max(2 x settle_seconds, 8 s)`. `run_all(gateway_ok=...)` reuses that result instead of pinging again, and a
+  gateway that never answered is recorded without running any test. The old "retry once if the gateway is unreachable" is gone
+  (the longer reconnect wait replaces it).
+- New tables `scan_runs`/`scan_hits` (only non-empty scans are stored). `Ranking(scores, skip, busy)` comes from
+  `DB.ranking()`. Cooldown: base x 2^(streak-1), max 12 h, base only if the IP passed in the last 24 h; "captive portal"
+  failures are ignored. Skipped IPs are appended after all others (shortest cooldown first), so they are only reached when
+  `max_candidates` is larger than the number of other candidates.
+- Scoring for `best-history`: score (last 5 results, failures = 0, +-2 h of the current hour double) - 20 x busy ratio
+  + 10 for an untested IP within 3 addresses of an IP scoring >= 60. Random and sequential order only get the skip rule.
+- `hunt` prints the time per candidate and the total.
