@@ -100,3 +100,93 @@ def test_db_path_uses_xdg(tmp_path, monkeypatch):
     with DB() as db:
         db.save(res())
     assert (tmp_path / "dorm-ip" / "history.db").exists()
+
+
+# ---- smart ordering (phase 1)
+NOW = datetime(2026, 10, 20, 15, 0).timestamp()
+
+
+
+def _fail(ip, ago_min, reason):
+    r = res(ip, passed=False, ts=NOW - ago_min * 60)
+    r.fail_reason = reason
+    return r
+
+
+def ok(ip, ago_min):
+    return res(ip, passed=True, ts=NOW - ago_min * 60)
+
+
+def test_recently_failed_ip_is_skipped_until_the_cooldown_ends(d):
+    d.save(_fail("172.18.40.7", 10, "gateway unreachable"))
+    rk = d.ranking(30, now=NOW)
+    assert rk.skip == {"172.18.40.7": pytest.approx(20.0)}
+    assert d.ranking(30, now=NOW + 3600).skip == {}  # an hour later it may be tried again
+
+
+def test_cooldown_doubles_per_consecutive_failure_with_a_cap(d):
+    for i, ago in enumerate((200, 100, 10)):
+        d.save(_fail("172.18.40.7", ago, "speed collapsed after 1.0 MB"))
+    assert d.ranking(30, now=NOW).skip["172.18.40.7"] == pytest.approx(120 - 10)  # 30 * 2^2
+    d2 = DB(":memory:")
+    for ago in range(10, 70, 10):
+        d2.save(_fail("172.18.40.8", ago, "x"))
+    assert d2.ranking(30, now=NOW).skip["172.18.40.8"] <= 720  # capped at 12 h
+    d2.close()
+
+
+def test_a_pass_resets_the_streak_and_good_ips_only_get_the_base_cooldown(d):
+    d.save(_fail("172.18.40.7", 300, "x"))
+    d.save(ok("172.18.40.7", 200))
+    assert d.ranking(30, now=NOW).skip == {}  # newest result is a pass... wait for failures after it
+    d.save(_fail("172.18.40.7", 100, "x"))
+    d.save(_fail("172.18.40.7", 10, "x"))
+    # two failures since the pass, but it passed within 24 h: base cooldown only (30 min, 10 min ago)
+    assert d.ranking(30, now=NOW).skip["172.18.40.7"] == pytest.approx(20.0)
+
+
+def test_portal_login_failures_never_count(d):
+    d.save(_fail("172.18.40.7", 5, "captive portal: login required"))
+    assert d.ranking(30, now=NOW).skip == {}
+    d.save(_fail("172.18.40.7", 4, "gateway unreachable"))
+    d.save(_fail("172.18.40.7", 3, "captive portal: login required"))
+    assert d.recent_failures(NOW)["172.18.40.7"].streak == 1
+
+
+def test_skipping_can_be_turned_off(d):
+    d.save(_fail("172.18.40.7", 1, "x"))
+    assert d.ranking(0, now=NOW).skip == {}
+
+
+def test_old_failures_are_forgotten(d):
+    d.save(_fail("172.18.40.7", 60 * 24 * 8, "x"))
+    assert d.recent_failures(NOW) == {}
+
+
+def test_hour_of_day_weighting(d):
+    morning, evening = datetime(2026, 10, 19, 9, 0).timestamp(), datetime(2026, 10, 19, 21, 0).timestamp()
+    d.save(res("172.18.40.1", passed=True, score=100.0, ts=evening))
+    d.save(res("172.18.40.1", passed=False, ts=morning))
+    assert d.scores()["172.18.40.1"] == 50.0
+    assert d.scores(hour=21)["172.18.40.1"] == pytest.approx(200 / 3)  # the evening pass counts double
+    assert d.scores(hour=9)["172.18.40.1"] == pytest.approx(100 / 3)
+    assert d.scores(hour=23)["172.18.40.1"] == pytest.approx(200 / 3)  # circular +-2 h
+    assert d.scores(hour=3)["172.18.40.1"] == 50.0
+
+
+def test_scan_history_and_busy_ratio(d):
+    d.save_scan({"172.18.40.1", "172.18.40.2"}, ts=1)
+    d.save_scan({"172.18.40.1"}, ts=2)
+    d.save_scan(set(), ts=3)  # empty scans carry no information and are not stored
+    assert d.busy_ratio() == {"172.18.40.1": 1.0, "172.18.40.2": 0.5}
+    for i in range(10):
+        d.save_scan({"172.18.40.3"}, ts=10 + i)
+    assert d.busy_ratio() == {"172.18.40.3": 1.0}  # only the last 10 scans count
+
+
+def test_ranking_bundles_everything(d):
+    d.save(res("172.18.40.1", passed=True, score=80.0, ts=NOW - 60))
+    d.save(_fail("172.18.40.2", 5, "x"))
+    d.save_scan({"172.18.40.3"}, ts=NOW)
+    rk = d.ranking(30, now=NOW)
+    assert rk.scores["172.18.40.1"] == 80.0 and "172.18.40.2" in rk.skip and rk.busy == {"172.18.40.3": 1.0}

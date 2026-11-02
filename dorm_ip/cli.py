@@ -5,6 +5,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from rich.live import Live
 from rich.markup import escape
 from rich.table import Table
 
-from . import applier, hunter, netinfo, portal, scanner, watchdog, wizard
+from . import applier, hunter, livecheck, netinfo, portal, scanner, watchdog, wizard
 from . import tests as nettests
 from .config import Config, ConfigError, default_config_path, find_config, load_config, with_overrides
 from .db import DB, IpStats, db_path, open_db
@@ -75,7 +76,7 @@ def _parse_dns(value: str) -> list[str]:
     return [str(_parse_ip(s, "DNS server")) for s in servers]
 
 
-def _begin_change(st: State, cfg: Config) -> str:
+def _begin_change(st: State, cfg: Config) -> applier.Target:
     """Resolve the connection and back up the original profile before changing anything."""
     target = applier.begin_change(
         cfg.network.interface,
@@ -83,7 +84,7 @@ def _begin_change(st: State, cfg: Config) -> str:
         dry_run=st.dry_run,
         notify=lambda m: err.print(f"[yellow]{escape(m)}[/yellow]"),
     )
-    return target.connection
+    return target
 
 
 def _try_profile(st: State, cfg: Config) -> NetProfile | None:
@@ -174,13 +175,22 @@ def set_ip(
     if addr not in net:
         err.print(f"[yellow]warning:[/yellow] {addr} is outside {net}; the gateway will be unreachable")
 
-    conn = _begin_change(st, cfg)
-    applier.apply_static(str(addr), plen, gateway, dns_list, connection=conn, dry_run=st.dry_run)
-    _done(st, f"Applied {addr}/{plen} gw {gateway} dns {','.join(dns_list)} on '{conn}'")
+    target = _begin_change(st, cfg)
+    sw = applier.switch_static(
+        str(addr), plen, gateway, dns_list, target=target, live=cfg.hunt.live_change == "auto", dry_run=st.dry_run
+    )
+    if sw.mode == "live":  # the running connection changed; now save it to the profile too
+        applier.persist_static(str(addr), plen, gateway, dns_list, connection=target.connection, dry_run=st.dry_run)
+    elif sw.note:
+        err.print(f"[yellow]{escape(sw.note)}[/yellow]")
+    how = "live, no reconnect" if sw.mode == "live" else "reconnected"
+    _done(st, f"Applied {addr}/{plen} gw {gateway} dns {','.join(dns_list)} on '{target.connection}' ({how})")
     if st.dry_run:
         return
 
-    status = hunter.settle_portal(cfg, str(addr), current.mac if current else "", login=not no_login)
+    status = hunter.settle_portal(
+        cfg, str(addr), current.mac if current else "", login=not no_login, live=sw.mode == "live"
+    )
     if status.state == "open" and status.logged_in:
         out.print("[green]Portal asked for login: logged in automatically.[/green]")
     elif status.state == "open":
@@ -197,7 +207,7 @@ def dhcp(ctx: typer.Context) -> None:
     """Switch the connection back to automatic (DHCP)."""
     st: State = ctx.obj
     cfg = st.load()
-    conn = _begin_change(st, cfg)
+    conn = _begin_change(st, cfg).connection
     applier.apply_dhcp(connection=conn, dry_run=st.dry_run)
     _done(st, f"'{conn}' is back on DHCP")
 
@@ -227,7 +237,7 @@ def _change_dns(st: State, servers: list[str] | None, mode: str) -> None:
     cfg = st.load()
     if servers is None:
         servers = cfg.dns.override if mode == "override" else cfg.dns.default
-    conn = _begin_change(st, cfg)
+    conn = _begin_change(st, cfg).connection
     applier.set_dns(servers, connection=conn, dry_run=st.dry_run)
     _done(st, f"DNS ({mode}) set to {','.join(servers)} on '{conn}'")
 
@@ -338,16 +348,20 @@ class LiveHunt(hunter.HuntObserver):
         self.live: Live | None = None
         self.final: hunter.Finalized | None = None
         self.tried = 0
+        self.started: float | None = None  # when the current candidate started
+
+    def _elapsed(self) -> str:
+        return "" if self.started is None else f"{time.monotonic() - self.started:.0f}s"
 
     def _table(self) -> Table:
         t = Table(box=None, pad_edge=False)
-        for col in ("#", "IP", "Seen", "Ping", "Quick", "Sustained", "Collapse", "Score", "Result"):
+        for col in ("#", "IP", "Seen", "Ping", "Quick", "Sustained", "Collapse", "Score", "Time", "Result"):
             t.add_column(col)
         for row in self.rows:
             t.add_row(*row)
         if self.current:
             ip, i, total, stage = self.current
-            t.add_row(f"{i}/{total}", ip, "", "", "", "", "", "", f"[dim]{escape(stage)}[/dim]")
+            t.add_row(f"{i}/{total}", ip, "", "", "", "", "", "", self._elapsed(), f"[dim]{escape(stage)}[/dim]")
         return t
 
     def _refresh(self) -> None:
@@ -364,6 +378,7 @@ class LiveHunt(hunter.HuntObserver):
 
     def trying(self, ip: str, index: int, total: int) -> None:
         self.current = (ip, index, total, "applying")
+        self.started = time.monotonic()
         self._refresh()
 
     def stage(self, ip: str, text: str) -> None:
@@ -373,7 +388,7 @@ class LiveHunt(hunter.HuntObserver):
 
     def skipped(self, ip: str, why: str) -> None:
         idx = self.current[1] if self.current else len(self.rows) + 1
-        self.rows.append((str(idx), ip, "", "", "", "", "", "", f"[red]skipped[/red] {escape(why[:40])}"))
+        self.rows.append((str(idx), ip, "", "", "", "", "", "", self._elapsed(), f"[red]skipped[/red] {escape(why[:40])}"))
         self.current = None
         self._refresh()
 
@@ -385,7 +400,7 @@ class LiveHunt(hunter.HuntObserver):
         status = "[green]PASS[/green]" if r.passed else f"[red]{escape((r.fail_reason or 'fail')[:42])}[/red]"
         self.rows.append((
             str(idx), r.ip, "yes" if r.seen_in_use else "", _fmt(r.ping_avg_ms, "", 0).strip(),
-            _fmt(r.quick_mbps, "").strip(), sus, coll, f"{r.score:.0f}", status,
+            _fmt(r.quick_mbps, "").strip(), sus, coll, f"{r.score:.0f}", self._elapsed(), status,
         ))
         self.current = None
         self._refresh()
@@ -423,6 +438,7 @@ def hunt_cmd(
         open_portal: Annotated[bool, typer.Option("--open-portal", help="Open the login page if login is required.")] = False,
         ignore_vpn: Annotated[bool, typer.Option("--ignore-vpn", help="Hunt even though a VPN carries the traffic.")] = False,
         force: Annotated[bool, typer.Option("--force", help="Skip the 'is this the dorm wifi?' check.")] = False,
+        retry_failed: Annotated[bool, typer.Option("--retry-failed", help="Also try IPs that failed recently.")] = False,
 ) -> None:
     """Find a fast, stable IP: scan, try candidates, stop at the first that passes."""
     st: State = ctx.obj
@@ -434,13 +450,16 @@ def hunt_cmd(
     obs = LiveHunt()
     d: DB | None = None if st.dry_run else open_db()
     try:
-        history = d.scores() if d is not None and cfg.hunt.order == "best-history" else None
-        if cfg.hunt.order == "best-history" and not history:
+        ranking = d.ranking(0 if retry_failed else cfg.hunt.skip_failed_minutes) if d is not None else None
+        if cfg.hunt.order == "best-history" and ranking is not None and not ranking.scores:
             err.print("[yellow]note:[/yellow] no history yet; best-history falls back to random order")
+        t0 = time.monotonic()
         result = hunter.hunt(
-            cfg, observer=obs, dry_run=st.dry_run, history=history,
+            cfg, observer=obs, dry_run=st.dry_run, ranking=ranking,
             spent=d.daily_bytes if d else None, save=d.save if d else None,
+            on_scan=d.save_scan if d else None,
         )
+        took = time.monotonic() - t0
         used_today = d.daily_bytes() if d else 0
     finally:
         obs.close()
@@ -450,12 +469,14 @@ def hunt_cmd(
     if st.dry_run:
         out.print("[dry-run] no tests were run and nothing was changed", markup=False)
         return
+    timing = f"{took:.0f}s for {obs.tried} candidates ({took / max(obs.tried, 1):.1f}s each)"
     if result is None:
-        err.print(f"[red]No passing IP found[/red] after {obs.tried} tried. Original profile restored.")
+        err.print(f"[red]No passing IP found[/red] after {obs.tried} tried ({timing}). Original profile restored.")
         raise SystemExit(1)
 
     out.print()
     _print_result(result, deep=True)
+    out.print(f"Hunt took {timing}", markup=False)
     out.print(f"Data used today: {used_today / 1e6:.0f} MB of {cfg.tests.data_budget_mb} MB budget")
     f = obs.final
     if f is None:
@@ -535,6 +556,9 @@ def history(
             shown = ", ".join(f"{s.ip} ({s.passes}/{s.tests})" for s in bad[:15])
             out.print(f"\nOften fail (passes/tests): {shown}" + (" ..." if len(bad) > 15 else ""), markup=False, highlight=False)
 
+        cooling = d.ranking(cfg.hunt.skip_failed_minutes).skip
+        if cooling:
+            out.print(f"\nCooling down after a failure (skipped by `hunt`): {len(cooling)} IPs", markup=False, highlight=False)
         ruler, bars = _hour_chart(d.hour_stats())
         out.print(f"\nHour of day  {ruler}\nPass rate    {bars}", markup=False, highlight=False)
 
@@ -597,9 +621,9 @@ def watch(
         def do_hunt():
             obs = LiveHunt()
             try:
-                history = d.scores() if cfg.hunt.order == "best-history" else None
                 return hunter.hunt(
-                    cfg, observer=obs, dry_run=st.dry_run, history=history, spent=d.daily_bytes, save=d.save
+                    cfg, observer=obs, dry_run=st.dry_run, ranking=d.ranking(cfg.hunt.skip_failed_minutes),
+                    spent=d.daily_bytes, save=d.save, on_scan=d.save_scan,
                 )
             finally:
                 obs.close()
@@ -639,6 +663,53 @@ def login(
     if not ok or state != "open":
         raise SystemExit(1)
 
+
+
+@app.command("live-check")
+def live_check_cmd(
+        ctx: typer.Context,
+        ip: Annotated[str | None, typer.Option("--ip", help="A known-good IP to switch to (default: your best IP from the history).")] = None,
+        compare: Annotated[bool, typer.Option("--compare", help="Also time the normal reconnect for comparison.")] = False,
+        force: Annotated[bool, typer.Option("--force", help="Skip the 'is this the dorm wifi?' check.")] = False,
+) -> None:
+    """Check on this machine whether switching the IP without a reconnect works, and how fast."""
+    st: State = ctx.obj
+    cfg = st.load()
+    profile = _try_profile(st, cfg)
+    _guard(cfg, profile, vpn=True, force=force)
+    if ip is None:
+        with open_db() as d:
+            best = sorted(d.scores().items(), key=lambda kv: -kv[1])
+        if not best or best[0][1] <= 0:
+            raise ConfigError("no known-good IP in the history yet: pass one with --ip (a dead IP would make the timing meaningless)")
+        ip = best[0][0]
+    addr = str(_parse_ip(ip))
+    if profile and profile.ip == addr:
+        raise ConfigError("that is already your current IP; pick a different known-good IP")
+
+    target = _begin_change(st, cfg)
+    if st.dry_run:
+        dns = cfg.dns.override if cfg.dns.hunt_with_override else cfg.dns.default
+        applier.apply_live(addr, cfg.network.prefix, cfg.network.gateway, dns, device=target.device, dry_run=True)
+        out.print("[dry-run] would then restore your original profile", markup=False)
+        return
+    out.print(f"Switching to {addr} live, then back (your original profile is restored at the end)...", markup=False)
+    steps = livecheck.run_live_check(cfg, target, addr, compare=compare)
+
+    t = Table(box=None, pad_edge=False)
+    for col in ("Method", "Command", "Address visible", "Gateway answers"):
+        t.add_column(col)
+    for s_ in steps:
+        t.add_row(
+            s_.method, _fmt(s_.applied_s, "s"), _fmt(s_.visible_s, "s") if s_.visible_s is not None else "never",
+            _fmt(s_.gateway_s, "s") if s_.gateway_s is not None else "never",
+        )
+    out.print(t)
+    level, msg = livecheck.verdict(steps)
+    colour = {"ok": "green", "warn": "yellow", "bad": "red"}[level]
+    out.print(f"[{colour}]{escape(msg)}[/{colour}]")
+    if level != "ok":
+        raise SystemExit(1)
 
 
 @app.command("init")

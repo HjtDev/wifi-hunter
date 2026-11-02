@@ -15,7 +15,11 @@ for you, keeps the winner, remembers what it learned, and watches the connection
   **collapse detection**.
 - **Auto-login** to the captive portal (replays the browser's login request; credentials stay in a `chmod 600` file).
 - **DNS override** support: hunts with a public DNS so the portal's DNS redirect does not get in the way, and keeps it.
-- **History** in SQLite: best IPs, the hours they were good, IPs that often fail; `best-history` ordering.
+- **Live IP switching**: changes the IP of the running connection instead of reconnecting the wifi for every
+  candidate (verified after each change, falls back to a normal reconnect if it does not work on your machine).
+- **History** in SQLite: best IPs, the hours they were good, IPs that often fail.
+- **Smart ordering**: IPs that failed recently are skipped for a while, and `best-history` ranks by past results
+  (weighted by the hour of day), busy IPs and neighbors of good IPs.
 - **Watchdog** that notices a degraded connection and re-hunts, without being fooled by VPNs, suspend/resume, other
   networks or your own heavy downloads.
 - A **daily data budget** for test traffic, and a safe **backup/restore** of your original network profile.
@@ -84,7 +88,8 @@ are shortcuts.
 | `dorm-ip info` | Show the live profile (IP, gateway, DNS, MAC) and warn if it does not match the config |
 | `dorm-ip scan` | arp-scan the configured ranges: which candidates are in use, and the order they would be tried |
 | `dorm-ip test [--no-deep]` | Run the full test suite on the current IP (`--no-deep` skips the sustained test) |
-| `dorm-ip hunt [--range A-B] [--max N] [--order ...] [--open-portal]` | Find a good IP and keep it |
+| `dorm-ip hunt [--range A-B] [--max N] [--order ...] [--open-portal] [--retry-failed]` | Find a good IP and keep it. Shows seconds per candidate; `--retry-failed` also tries IPs that failed recently |
+| `dorm-ip live-check [--ip IP] [--compare]` | Check on this machine that switching the IP without a reconnect works, and time it against a reconnect |
 | `dorm-ip watch [--notify/--no-notify]` | Watch the connection and re-hunt when it degrades |
 | `dorm-ip history [--top N]` | Best IPs, when they were good, IPs that often fail, pass rate by hour |
 | `dorm-ip set <ip> [--dns A,B] [--gw X] [--prefix N] [--no-login]` | Apply a static IP. **Keeps your current DNS** unless `--dns` is given; logs in to the portal if it asks |
@@ -122,6 +127,23 @@ nothing passed / error / Ctrl+C / SIGTERM  ->  restore the original profile
 | DNS | resolve time of a few domains, asked directly from the active DNS server |
 | Quick speed | one 5 MB download |
 | Sustained | downloads for `sustained_seconds`, sampled every `sample_interval`; reports average, minimum and the **collapse point** (speed under `collapse_below_mbps` for 2 s, reported as "after N MB") |
+
+**Faster than one reconnect per candidate.** By default (`hunt.live_change = "auto"`) the tool changes the address of the
+*running* connection (`nmcli device modify`) instead of reconnecting. After every switch it reads the address back and
+requires exactly the new one; if NetworkManager refuses or the address did not change, it says so, uses full reconnects for the
+rest of the hunt and carries on. Instead of a fixed wait it polls the gateway, so a candidate that is ready in half a second
+is tested at once, and a dead one is recorded as soon as the wait runs out. While candidates are tried the saved
+NetworkManager profile is not touched; only the winner is written to it. Run `dorm-ip live-check --compare` once to see the
+real timings on your wifi.
+
+**Smart ordering.** Every result and ARP scan is kept in the history and used to order the next hunt:
+
+| Rule | Effect |
+|---|---|
+| Recently failed IPs are skipped | cooldown `hunt.skip_failed_minutes` (30), doubling per consecutive failure up to 12 h; an IP that passed in the last 24 h only gets the base cooldown; "login required" never counts as a failure; skipped IPs are still used if there are not enough other candidates; `--retry-failed` ignores it |
+| Hour of day | with `order = "best-history"`, results from within 2 hours of now count double, so an IP that is good in the evening ranks higher in the evening |
+| Busy IPs | IPs seen in use in many of the last 10 scans rank lower |
+| Near good IPs | untested IPs within 3 addresses of a known-good one get a small bonus (`hunt.explore_near_good`) |
 
 **Pass/fail.** Hard fails (score 0): gateway down, no internet, portal blocking, packet loss over the limit, speed
 collapse, DNS or download failure. Threshold fails: ping above `max_ping_ms`, or speed below the limit. With
@@ -187,7 +209,10 @@ the config.
 | | `min_speed_mbps`, `min_sustained_mbps` | speed limits (8 Mbps = 1 MB/s) |
 | | `speed_rule` | `either` (quick or sustained is enough) or `both` |
 | | `collapse_below_mbps` | below this for 2 s counts as a collapse |
-| `[hunt]` | `max_candidates`, `order`, `settle_seconds` | candidates per hunt; `random`/`sequential`/`best-history`; wait after applying an IP |
+| `[hunt]` | `max_candidates`, `order` | candidates per hunt; `random`/`sequential`/`best-history` |
+| | `settle_seconds` | longest wait for the gateway after a live switch (a reconnect waits at least twice as long) |
+| | `live_change` | `auto` (switch without reconnecting, verified) or `off` |
+| | `skip_failed_minutes`, `explore_near_good` | cooldown after a failed IP (0 = off); bonus for untested neighbors of good IPs |
 | `[watchdog]` | `interval_seconds`, `probe_bytes`, `bad_checks_to_rehunt`, `notify` | check cadence and trigger |
 | | `min_probe_mbps`, `rehunt_cooldown_seconds`, `busy_mbps` | probe limit (slow-start aware), back-off, "link busy" threshold |
 | `[portal]` | `enabled`, `url`, `method`, `content_type`, `fields`, `headers` | the login request (`{username}` `{password}` `{ip}` `{mac}` are filled in) |
@@ -260,6 +285,10 @@ every 10 s about 1.7 GB), so keep the interval long if your daily limit matters.
 - **Login works but the portal host does not resolve**: set `portal.host_ip` to the portal's address.
 - **"does not look like the dorm wifi"**: the gateway differs from `network.gateway`. Fix the config or use `--force`.
 - **"a VPN/tunnel is carrying your traffic"**: disconnect the VPN before `test`/`hunt`.
+- **"live IP switching is not working here"**: your driver or NetworkManager version does not apply the change live; the hunt
+  continues with reconnects. Run `dorm-ip live-check --compare` to see why, and set `hunt.live_change = "off"` to silence it.
+- **A good IP is never tried**: it is probably cooling down after a failure (`dorm-ip history` shows how many are). Use
+  `dorm-ip hunt --retry-failed`, or set `hunt.skip_failed_minutes = 0`.
 - **Everything is slow after `hunt` gave up**: it restored your original profile (DHCP, dorm DNS); log in to the portal
   or run `dorm-ip hunt` again.
 
@@ -272,9 +301,10 @@ uv run pytest        # no real network calls; nmcli, ping, arp-scan and httpx ar
 
 Layout: `cli.py` (thin typer CLI), `config.py`, `models.py`, `netinfo.py` (nmcli/ip), `applier.py` (change/restore),
 `scanner.py`, `tests.py` (probes), `scorer.py`, `hunter.py`, `watchdog.py`, `db.py`, `portal.py` (auto-login, cURL
-import), `dnsq.py` (DNS packets), `wizard.py` (`init`). Design decisions are in [`NOTES.md`](NOTES.md).
+import), `dnsq.py` (DNS packets), `livecheck.py`, `wizard.py` (`init`). Design decisions are in [`NOTES.md`](NOTES.md).
 
-## Not built yet
+## Roadmap
 
-MAC randomization (`applier.set_mac`; the MAC is already stored with every result so you can analyze per-MAC behavior)
+See [`ROADMAP.md`](ROADMAP.md) for the path to v0.9 (parallel triage, `--find N`, standby IPs, shell alias step, CI).
+Not built yet: MAC randomization (`applier.set_mac`; the MAC is already stored with every result so you can analyze per-MAC behavior)
 and a TUI.

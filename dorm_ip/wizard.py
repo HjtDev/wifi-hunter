@@ -45,7 +45,10 @@ SCHEMA: list[tuple[str, list[tuple[str, str]]]] = [
     ]),
     ("hunt", [
         ("max_candidates", ""), ("order", "random | sequential | best-history"),
-        ("settle_seconds", "wait after applying an IP"),
+        ("settle_seconds", "max wait for the gateway after a live IP switch (a reconnect waits longer)"),
+        ("live_change", "auto: switch IPs without reconnecting (verified, falls back) | off"),
+        ("skip_failed_minutes", "don't retry a failed IP for this long (doubles per failure, 0 = off)"),
+        ("explore_near_good", "best-history: try untested IPs next to known-good ones sooner"),
     ]),
     ("watchdog", [
         ("interval_seconds", ""), ("probe_bytes", ""), ("bad_checks_to_rehunt", ""), ("notify", ""),
@@ -421,7 +424,7 @@ def _portal_request(
             return {}
     if not curl_text:
         curl_text = p.paste(
-            "\nTo log in automatically You need the browser's login request:\n"
+            "\nTo log in automatically I need the browser's login request:\n"
             "  1. Open the portal login page, press F12 and open the Network tab.\n"
             "  2. Log in. Right-click the login request (usually a POST) > Copy > Copy as cURL (bash).\n"
             "  3. Paste it here, then press Enter on an empty line. (Blank = skip for now.)"

@@ -243,6 +243,7 @@ def run_all(
         profile: NetProfile | None = None,
         progress: Progress | None = None,
         on_portal: Callable[[], bool] | None = None,
+        gateway_ok: bool | None = None,
 ) -> TestResult:
     """Run the suite in order and stop at the first failure. bytes_used counts HTTP
     payload only (ping/DNS traffic is negligible)."""
@@ -269,7 +270,8 @@ def run_all(
         return scorer.failure(r, cfg, final=False)[0] is not None
 
     say("Gateway reachable?")
-    r.gateway_ok = gateway_reachable(cfg.network.gateway)
+    # the hunter already polled the gateway while waiting for the link: don't ping it again
+    r.gateway_ok = gateway_ok if gateway_ok is not None else gateway_reachable(cfg.network.gateway)
     if not r.gateway_ok:
         return finish()
 

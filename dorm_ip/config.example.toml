@@ -38,7 +38,10 @@ speed_rule          = "either"        # either: quick OR sustained is enough | b
 [hunt]
 max_candidates = 30
 order          = "best-history"       # random | sequential | best-history
-settle_seconds = 4                    # wait after applying an IP
+settle_seconds = 4                    # max wait for the gateway after a live IP switch (a reconnect waits longer)
+live_change    = "auto"               # auto: switch IPs without reconnecting (verified, falls back) | off
+skip_failed_minutes = 30              # don't retry a failed IP for this long (doubles per failure, 0 = off)
+explore_near_good   = true            # best-history: try untested IPs next to known-good ones sooner
 
 [watchdog]
 interval_seconds        = 30

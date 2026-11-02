@@ -92,3 +92,9 @@ def test_prefix_mismatch_warning(tmp_path):
 def test_no_warning_when_matching(tmp_path):
     p = NetProfile("wlan0", "Dorm", "auto", "172.18.40.77", 21, "172.18.47.254", [], "m")
     assert netinfo.check_profile(p, _cfg(tmp_path)) == []
+
+
+def test_parse_live_addresses():
+    text = "IP4.ADDRESS[1]:172.18.40.9/21\nIP4.ADDRESS[2]:10.0.0.2/24\nIP4.GATEWAY:172.18.47.254\n"
+    assert netinfo.parse_live_addresses(text) == ["172.18.40.9", "10.0.0.2"]
+    assert netinfo.parse_live_addresses("") == []

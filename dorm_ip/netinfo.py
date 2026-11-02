@@ -112,7 +112,16 @@ def parse_live(text: str) -> tuple[str | None, int | None, str | None, list[str]
     return ip, prefix, gateway, dns
 
 
+def parse_live_addresses(text: str) -> list[str]:
+    """All IPv4 addresses from `nmcli -t -f IP4.ADDRESS dev show X`."""
+    return [v.partition("/")[0] for k, v in parse_kv(text).items() if k.startswith("IP4.ADDRESS") and v]
+
+
 # ---------------------------------------------------------------- queries
+
+def live_addresses(device: str) -> list[str]:
+    return parse_live_addresses(nmcli("-t", "-f", "IP4.ADDRESS", "dev", "show", device))
+
 
 def active_wifi() -> list[tuple[str, str]]:
     text = nmcli("-t", "-f", "NAME,TYPE,DEVICE", "con", "show", "--active")

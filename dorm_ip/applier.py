@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -112,6 +113,16 @@ def backup_profile(p: NetProfile, dry_run: bool = False) -> Path:
 
 # ---------------------------------------------------------------- apply
 
+def _static_args(ip: str, prefix: int, gateway: str, dns: list[str]) -> list[str]:
+    return [
+        "ipv4.method", "manual",
+        "ipv4.addresses", f"{ip}/{prefix}",
+        "ipv4.gateway", gateway,
+        "ipv4.dns", ",".join(dns),
+        "ipv4.ignore-auto-dns", "yes" if dns else "no",
+    ]
+
+
 def apply_static(
         ip: str,
         prefix: int,
@@ -121,18 +132,75 @@ def apply_static(
         connection: str,
         dry_run: bool = False,
 ) -> None:
-    _nm(
-        [
-            "con", "mod", connection,
-            "ipv4.method", "manual",
-            "ipv4.addresses", f"{ip}/{prefix}",
-            "ipv4.gateway", gateway,
-            "ipv4.dns", ",".join(dns),
-            "ipv4.ignore-auto-dns", "yes" if dns else "no",
-        ],
-        dry_run,
-    )
+    """Change the saved profile and reconnect (the wifi drops and re-associates)."""
+    _nm(["con", "mod", connection, *_static_args(ip, prefix, gateway, dns)], dry_run)
     _nm(["con", "up", connection], dry_run)
+
+
+def apply_live(
+        ip: str, prefix: int, gateway: str, dns: list[str], *, device: str, dry_run: bool = False
+) -> None:
+    """Change the address of the *running* connection only: no reconnect, saved profile untouched."""
+    _nm(["device", "modify", device, *_static_args(ip, prefix, gateway, dns)], dry_run)
+
+
+def persist_static(
+        ip: str, prefix: int, gateway: str, dns: list[str], *, connection: str, dry_run: bool = False
+) -> None:
+    """Save the settings to the profile without reconnecting (after a live switch)."""
+    _nm(["con", "mod", connection, *_static_args(ip, prefix, gateway, dns)], dry_run)
+
+
+def verify_live(
+        ip: str,
+        device: str,
+        *,
+        timeout: float = 2.0,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """True once the device has exactly one IPv4 address and it is `ip`."""
+    deadline = clock() + timeout
+    while True:
+        if netinfo.live_addresses(device) == [ip]:
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(0.1)
+
+
+@dataclass
+class SwitchResult:
+    mode: str  # "live" | "reconnect"
+    note: str = ""  # why a live switch was not used
+
+
+def switch_static(
+        ip: str,
+        prefix: int,
+        gateway: str,
+        dns: list[str],
+        *,
+        target: Target,
+        live: bool,
+        dry_run: bool = False,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+) -> SwitchResult:
+    """Move to `ip`. With live=True try the no-reconnect switch first and *check* that it took
+    effect; if it did not (or nmcli refuses), fall back to the normal reconnect."""
+    note = ""
+    if live and target.device:
+        try:
+            apply_live(ip, prefix, gateway, dns, device=target.device, dry_run=dry_run)
+            if dry_run or verify_live(ip, target.device, sleep=sleep, clock=clock):
+                return SwitchResult("live")
+            note = "the address did not change on the running connection"
+        except NetError as e:
+            note = str(e)
+        note = f"live IP switching is not working here ({note}); using full reconnects"
+    apply_static(ip, prefix, gateway, dns, connection=target.connection, dry_run=dry_run)
+    return SwitchResult("reconnect", note)
 
 
 def apply_dhcp(*, connection: str, dry_run: bool = False) -> None:
@@ -163,7 +231,7 @@ def set_dns(dns: list[str], *, connection: str, dry_run: bool = False) -> None:
     _nm(["con", "up", connection], dry_run)
 
 
-def restore(dry_run: bool = False) -> str:
+def restore(dry_run: bool = False, keep_backup: bool = False) -> str:
     """Put the backed-up original settings back. Returns the connection name."""
     path = backup_path()
     if not path.exists():
@@ -187,6 +255,6 @@ def restore(dry_run: bool = False) -> str:
         dry_run,
     )
     _nm(["con", "up", connection], dry_run)
-    if not dry_run:
+    if not dry_run and not keep_backup:
         path.unlink(missing_ok=True)
     return connection
