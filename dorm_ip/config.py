@@ -68,7 +68,10 @@ class ThresholdsCfg:
 class HuntCfg:
     max_candidates: int = 30
     order: str = "random"  # random | sequential | best-history
-    settle_seconds: float = 4
+    settle_seconds: float = 4  # max wait for the gateway after a live IP switch (a reconnect waits longer)
+    live_change: str = "auto"  # auto: switch the IP without reconnecting (verified, falls back) | off
+    skip_failed_minutes: float = 30  # cooldown after a failed test, doubling per failure; 0 = never skip
+    explore_near_good: bool = True  # best-history: small bonus for untested IPs next to known-good ones
 
 
 @dataclass
@@ -203,6 +206,10 @@ def _validate(cfg: Config) -> None:
         raise ConfigError(f"config: dns.final_mode must be one of {sorted(_VALID_FINAL)}")
     if cfg.thresholds.speed_rule not in ("both", "either"):
         raise ConfigError("config: thresholds.speed_rule must be 'both' or 'either'")
+    if cfg.hunt.live_change not in ("auto", "off"):
+        raise ConfigError("config: hunt.live_change must be 'auto' or 'off'")
+    if cfg.hunt.skip_failed_minutes < 0:
+        raise ConfigError("config: hunt.skip_failed_minutes must not be negative")
     if cfg.hunt.order not in _VALID_ORDER:
         raise ConfigError(f"config: hunt.order must be one of {sorted(_VALID_ORDER)}")
     if not n.ranges:

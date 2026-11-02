@@ -5,32 +5,38 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import date, datetime
 from pathlib import Path
 
 from .models import CheckResult, TestResult
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS results (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts REAL NOT NULL, ip TEXT NOT NULL, mac TEXT, dns_mode TEXT,
-    seen_in_use INTEGER, gateway_ok INTEGER, portal_state TEXT,
-    ping_avg_ms REAL, ping_loss_pct REAL, ping_jitter_ms REAL, dns_ms REAL,
-    quick_mbps REAL, sustained_avg_mbps REAL, sustained_min_mbps REAL, collapse_after_mb REAL,
-    bytes_used INTEGER, score REAL, passed INTEGER, fail_reason TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_results_ip_ts ON results(ip, ts);
-CREATE TABLE IF NOT EXISTS daily_usage (day TEXT PRIMARY KEY, bytes INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS checks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts REAL NOT NULL, ip TEXT, mac TEXT, gateway_ok INTEGER, loss_pct REAL, rtt_ms REAL,
-    probe_mbps REAL, bytes_used INTEGER, ok INTEGER, note TEXT
-);
-"""
+         CREATE TABLE IF NOT EXISTS results (
+                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                ts REAL NOT NULL, ip TEXT NOT NULL, mac TEXT, dns_mode TEXT,
+                                                seen_in_use INTEGER, gateway_ok INTEGER, portal_state TEXT,
+                                                ping_avg_ms REAL, ping_loss_pct REAL, ping_jitter_ms REAL, dns_ms REAL,
+                                                quick_mbps REAL, sustained_avg_mbps REAL, sustained_min_mbps REAL, collapse_after_mb REAL,
+                                                bytes_used INTEGER, score REAL, passed INTEGER, fail_reason TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_results_ip_ts ON results(ip, ts);
+         CREATE TABLE IF NOT EXISTS daily_usage (day TEXT PRIMARY KEY, bytes INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE IF NOT EXISTS scan_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL);
+         CREATE TABLE IF NOT EXISTS scan_hits (run_id INTEGER NOT NULL, ip TEXT NOT NULL, PRIMARY KEY (run_id, ip));
+         CREATE TABLE IF NOT EXISTS checks (
+                                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                               ts REAL NOT NULL, ip TEXT, mac TEXT, gateway_ok INTEGER, loss_pct REAL, rtt_ms REAL,
+                                               probe_mbps REAL, bytes_used INTEGER, ok INTEGER, note TEXT
+         ); \
+         """
 
 SCORE_WINDOW = 5  # best-history looks at the last N results per IP
 FLAKY_MIN_TESTS = 3
+HOUR_RADIUS = 2  # results from within +-2 h of the current hour of day count double
+SKIP_CAP_MINUTES = 720.0  # a failed IP is never skipped for longer than 12 h
+BUSY_WINDOW = 10  # last N ARP scans
+NEUTRAL_FAILURE_PREFIX = "captive portal"  # "login required" says nothing about the IP's quality
 
 
 def db_path() -> Path:
@@ -40,6 +46,22 @@ def db_path() -> Path:
 
 def _day(ts: float | None = None) -> str:
     return (datetime.fromtimestamp(ts) if ts is not None else datetime.now()).strftime("%Y-%m-%d")
+
+
+@dataclass
+class FailInfo:
+    streak: int  # consecutive failures, newest first (portal-login results are ignored)
+    last_fail_ts: float
+    passed_24h: bool
+
+
+@dataclass
+class Ranking:
+    """Everything the hunt order needs from history."""
+
+    scores: dict[str, float] = field(default_factory=dict)  # ip -> 0-100, hour-of-day weighted
+    skip: dict[str, float] = field(default_factory=dict)  # ip -> minutes of cooldown left
+    busy: dict[str, float] = field(default_factory=dict)  # ip -> share of recent scans that saw it in use
 
 
 @dataclass
@@ -123,32 +145,105 @@ class DB:
 
     # ------------------------------------------------------------ ordering
 
-    def scores(self, window: int = SCORE_WINDOW) -> dict[str, float]:
-        """ip -> mean of the last `window` results, where a failed test counts as 0."""
-        out: dict[str, list[float]] = {}
-        for row in self.conn.execute("SELECT ip, passed, score FROM results ORDER BY ts DESC, id DESC"):
-            vals = out.setdefault(row["ip"], [])
-            if len(vals) < window:
-                vals.append(float(row["score"]) if row["passed"] else 0.0)
-        return {ip: sum(v) / len(v) for ip, v in out.items()}
+    def scores(self, window: int = SCORE_WINDOW, hour: int | None = None) -> dict[str, float]:
+        """ip -> weighted mean of the last `window` results, a failed test counting as 0.
+
+        With `hour` (0-23), results from within +-2 hours of that hour of day weigh double: an IP
+        that is good in the evening is ranked higher in the evening."""
+        rows: dict[str, list[tuple[float, float]]] = {}
+        for row in self.conn.execute("SELECT ip, ts, passed, score FROM results ORDER BY ts DESC, id DESC"):
+            vals = rows.setdefault(row["ip"], [])
+            if len(vals) >= window:
+                continue
+            weight = 1.0
+            if hour is not None:
+                diff = abs(datetime.fromtimestamp(row["ts"]).hour - hour)
+                if min(diff, 24 - diff) <= HOUR_RADIUS:
+                    weight = 2.0
+            vals.append((float(row["score"]) if row["passed"] else 0.0, weight))
+        return {ip: sum(v * w for v, w in vals) / sum(w for _, w in vals) for ip, vals in rows.items()}
+
+    # ------------------------------------------------------------ smart ordering
+
+    def save_scan(self, used: set[str], ts: float | None = None) -> None:
+        """Remember which IPs an ARP scan saw in use (empty scans carry no information)."""
+        if not used:
+            return
+        with self.conn:
+            cur = self.conn.execute("INSERT INTO scan_runs(ts) VALUES(?)", (ts if ts is not None else time.time(),))
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO scan_hits(run_id, ip) VALUES(?, ?)", [(cur.lastrowid, ip) for ip in used]
+            )
+
+    def busy_ratio(self, window: int = BUSY_WINDOW) -> dict[str, float]:
+        runs = [r["id"] for r in self.conn.execute("SELECT id FROM scan_runs ORDER BY id DESC LIMIT ?", (window,))]
+        if not runs:
+            return {}
+        marks = ",".join("?" * len(runs))
+        rows = self.conn.execute(
+            f"SELECT ip, COUNT(*) AS n FROM scan_hits WHERE run_id IN ({marks}) GROUP BY ip", runs
+        )
+        return {r["ip"]: r["n"] / len(runs) for r in rows}
+
+    def recent_failures(self, now: float | None = None, days: int = 7) -> dict[str, FailInfo]:
+        now = time.time() if now is None else now
+        per_ip: dict[str, list[sqlite3.Row]] = {}
+        for row in self.conn.execute(
+                "SELECT ip, ts, passed, fail_reason FROM results WHERE ts >= ? ORDER BY ts DESC, id DESC",
+                (now - days * 86400,),
+        ):
+            per_ip.setdefault(row["ip"], []).append(row)
+        out: dict[str, FailInfo] = {}
+        for ip, rows in per_ip.items():
+            streak, last_fail, passed_24h, counting = 0, 0.0, False, True
+            for row in rows:
+                if row["passed"]:
+                    passed_24h = passed_24h or row["ts"] >= now - 86400
+                    counting = False
+                    continue
+                if (row["fail_reason"] or "").startswith(NEUTRAL_FAILURE_PREFIX):
+                    continue
+                if counting:
+                    streak += 1
+                    last_fail = max(last_fail, row["ts"])
+            out[ip] = FailInfo(streak, last_fail, passed_24h)
+        return out
+
+    def ranking(self, skip_base_minutes: float, now: float | None = None, hour: int | None = None) -> Ranking:
+        """Scores, cooldowns and busy-ness for ordering the next hunt.
+
+        Cooldown after a failure = skip_base_minutes, doubled per consecutive failure (max 12 h);
+        an IP that passed in the last 24 h only gets the base cooldown (good IPs flake)."""
+        now = time.time() if now is None else now
+        hour = datetime.fromtimestamp(now).hour if hour is None else hour
+        skip: dict[str, float] = {}
+        if skip_base_minutes > 0:
+            for ip, fi in self.recent_failures(now).items():
+                if fi.streak == 0:
+                    continue
+                factor = 1 if fi.passed_24h else 2 ** (fi.streak - 1)
+                left = min(skip_base_minutes * factor, SKIP_CAP_MINUTES) - (now - fi.last_fail_ts) / 60
+                if left > 0:
+                    skip[ip] = left
+        return Ranking(self.scores(hour=hour), skip, self.busy_ratio())
 
     # ------------------------------------------------------------ history
 
     def ip_stats(self) -> list[IpStats]:
         hours: dict[str, dict[int, list[int]]] = {}
         for row in self.conn.execute(
-            "SELECT ip, CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER) AS h, "
-            "COUNT(*) AS n, SUM(passed) AS p FROM results GROUP BY ip, h"
+                "SELECT ip, CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER) AS h, "
+                "COUNT(*) AS n, SUM(passed) AS p FROM results GROUP BY ip, h"
         ):
             hours.setdefault(row["ip"], {})[row["h"]] = [row["n"], row["p"] or 0]
 
         stats = []
         for row in self.conn.execute(
-            "SELECT ip, COUNT(*) AS n, SUM(passed) AS p, "
-            "SUM(CASE WHEN passed THEN score ELSE 0 END) * 1.0 / COUNT(*) AS eff, "
-            "AVG(CASE WHEN passed THEN score END) AS avg_score, "
-            "AVG(CASE WHEN passed THEN sustained_avg_mbps END) AS sus, MAX(ts) AS last_ts "
-            "FROM results GROUP BY ip"
+                "SELECT ip, COUNT(*) AS n, SUM(passed) AS p, "
+                "SUM(CASE WHEN passed THEN score ELSE 0 END) * 1.0 / COUNT(*) AS eff, "
+                "AVG(CASE WHEN passed THEN score END) AS avg_score, "
+                "AVG(CASE WHEN passed THEN sustained_avg_mbps END) AS sus, MAX(ts) AS last_ts "
+                "FROM results GROUP BY ip"
         ):
             good = sorted(h for h, (n, p) in hours.get(row["ip"], {}).items() if p > 0 and p / n >= 0.5)
             stats.append(
