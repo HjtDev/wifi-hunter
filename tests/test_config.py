@@ -111,3 +111,20 @@ def test_watchdog_new_keys_have_defaults(tmp_path):
 def test_override_max_and_order(tmp_path):
     cfg = with_overrides(load_config(write(tmp_path, BASE)), max_candidates=7, order="sequential")
     assert cfg.hunt.max_candidates == 7 and cfg.hunt.order == "sequential"
+
+
+def test_hunt_live_and_skip_settings(tmp_path):
+    cfg = load_config(write(tmp_path, BASE))
+    assert cfg.hunt.live_change == "auto" and cfg.hunt.skip_failed_minutes == 30 and cfg.hunt.explore_near_good
+    with pytest.raises(ConfigError, match="live_change"):
+        load_config(write(tmp_path, BASE + '[hunt]\nlive_change = "yes"\n'))
+    with pytest.raises(ConfigError, match="skip_failed_minutes"):
+        load_config(write(tmp_path, BASE + "[hunt]\nskip_failed_minutes = -1\n"))
+    assert load_config(write(tmp_path, BASE + '[hunt]\nlive_change = "off"\nskip_failed_minutes = 0\n')).hunt.live_change == "off"
+
+
+def test_example_config_has_the_new_keys():
+    from dorm_ip import wizard
+
+    h = wizard.example_values()["hunt"]
+    assert h["live_change"] == "auto" and h["skip_failed_minutes"] == 30 and h["explore_near_good"] is True

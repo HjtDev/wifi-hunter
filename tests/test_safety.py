@@ -75,7 +75,19 @@ def run_cli(cfg, monkeypatch, tmp_path):
     monkeypatch.setattr(netinfo, "get_profile", lambda i, c: calls.get("profile", PROFILE))
     monkeypatch.setattr(netinfo, "tunnel_device", lambda i: calls["tun"])
     monkeypatch.setattr(applier, "begin_change", lambda i, c, dry_run=False, notify=None: applier.Target("Khabgah", "wlan0"))
-    monkeypatch.setattr(applier, "apply_static", lambda ip, prefix, gw, dns, *, connection, dry_run=False: calls["apply"].append((ip, list(dns))))
+    calls["mode"] = "reconnect"
+    calls["persist"] = []
+
+    def switch(ip, prefix, gw, dns, *, target, live, dry_run=False, sleep=None, clock=None):
+        calls["apply"].append((ip, list(dns)))
+        calls["live_requested"] = live
+        if live and calls["mode"] == "live":
+            return applier.SwitchResult("live")
+        return applier.SwitchResult("reconnect", "live IP switching is not working here (test)" if live else "")
+
+    monkeypatch.setattr(applier, "switch_static", switch)
+    monkeypatch.setattr(applier, "persist_static", lambda ip, p, g, d, *, connection, dry_run=False: calls["persist"].append(ip))
+    monkeypatch.setattr(nt, "ping", lambda t, n, wait=2: (20.0, 0.0, 1.0))
     monkeypatch.setattr(nt, "check_portal", lambda c: calls["portal"])
     monkeypatch.setattr(hunter, "_login", lambda c, ip="", mac="": calls["login"].append((ip, mac)) or (True, "HTTP 200"))
 
@@ -156,3 +168,19 @@ def test_path_command(run_cli, tmp_path):
     assert run_cli("path", "backup").output.strip().endswith("backup.json")
     assert run_cli("path", "credentials").output.strip().endswith("credentials.toml")
     assert run_cli("path", "nope").exit_code == 1
+
+
+def test_set_switches_live_and_saves_the_profile(run_cli, monkeypatch):
+    sleepless(monkeypatch)
+    run_cli.calls["mode"] = "live"
+    r = run_cli("set", "172.18.40.130")
+    assert r.exit_code == 0 and "live, no reconnect" in " ".join(r.output.split())
+    assert run_cli.calls["live_requested"] is True and run_cli.calls["persist"] == ["172.18.40.130"]
+
+
+def test_set_reports_when_live_switching_does_not_work(run_cli, monkeypatch):
+    sleepless(monkeypatch)
+    r = run_cli("set", "172.18.40.130")
+    flat = " ".join(r.output.split())
+    assert r.exit_code == 0 and "not working here" in flat and "reconnected" in flat
+    assert run_cli.calls["persist"] == []  # the reconnect path already saved the profile
