@@ -72,6 +72,8 @@ class HuntCfg:
     live_change: str = "auto"  # auto: switch the IP without reconnecting (verified, falls back) | off
     skip_failed_minutes: float = 30  # cooldown after a failed test, doubling per failure; 0 = never skip
     explore_near_good: bool = True  # best-history: small bonus for untested IPs next to known-good ones
+    triage_batch: int = 12  # candidates filtered in parallel before the full serial tests (0/1 = one by one)
+    find: int = 1  # how many IPs must pass the full test (the best is kept, the rest go to standby)
 
 
 @dataclass
@@ -87,6 +89,12 @@ class WatchdogCfg:
     # If the wifi interface itself carries more than this (Mbps) between two checks, a slow probe
     # is blamed on your own traffic and ignored. 0 disables the rule.
     busy_mbps: float = 2.0
+
+
+@dataclass
+class StandbyCfg:
+    max_age_hours: float = 12  # standby IPs older than this are forgotten
+    failover: bool = True  # the watchdog tries standby IPs before running a full hunt
 
 
 @dataclass
@@ -123,6 +131,7 @@ class Config:
     hunt: HuntCfg
     watchdog: WatchdogCfg
     portal: PortalCfg
+    standby: StandbyCfg = field(default_factory=StandbyCfg)
     # computed by finalize():
     ips: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -208,6 +217,10 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("config: thresholds.speed_rule must be 'both' or 'either'")
     if cfg.hunt.live_change not in ("auto", "off"):
         raise ConfigError("config: hunt.live_change must be 'auto' or 'off'")
+    if cfg.hunt.triage_batch < 0 or cfg.hunt.triage_batch > 40:
+        raise ConfigError("config: hunt.triage_batch must be between 0 and 40")
+    if cfg.hunt.find < 1:
+        raise ConfigError("config: hunt.find must be at least 1")
     if cfg.hunt.skip_failed_minutes < 0:
         raise ConfigError("config: hunt.skip_failed_minutes must not be negative")
     if cfg.hunt.order not in _VALID_ORDER:
@@ -282,7 +295,7 @@ def load_config(path: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{p}: invalid TOML: {e}") from None
 
-    known = {"network", "dns", "tests", "thresholds", "hunt", "watchdog", "portal"}
+    known = {"network", "dns", "tests", "thresholds", "hunt", "watchdog", "portal", "standby"}
     unknown = set(raw) - known
     if unknown:
         raise ConfigError(f"config: unknown section(s): {', '.join(sorted(unknown))}")
@@ -298,6 +311,7 @@ def load_config(path: Path | None = None) -> Config:
         hunt=_build(HuntCfg, raw.get("hunt", {}), "hunt"),
         watchdog=_build(WatchdogCfg, raw.get("watchdog", {}), "watchdog"),
         portal=_build(PortalCfg, raw.get("portal", {}), "portal"),
+        standby=_build(StandbyCfg, raw.get("standby", {}), "standby"),
         source=p,
     )
     return finalize(cfg)
@@ -311,6 +325,8 @@ def with_overrides(
         prefix: int | None = None,
         max_candidates: int | None = None,
         order: str | None = None,
+        find: int | None = None,
+        triage_batch: int | None = None,
 ) -> Config:
     """Apply per-run CLI overrides and re-expand/validate."""
     hunt = cfg.hunt
@@ -318,6 +334,10 @@ def with_overrides(
         hunt = replace(hunt, max_candidates=max_candidates)
     if order is not None:
         hunt = replace(hunt, order=order)
+    if find is not None:
+        hunt = replace(hunt, find=find)
+    if triage_batch is not None:
+        hunt = replace(hunt, triage_batch=triage_batch)
     cfg = replace(cfg, hunt=hunt)
     net = cfg.network
     if ranges is not None:

@@ -42,6 +42,12 @@ settle_seconds = 4                    # max wait for the gateway after a live IP
 live_change    = "auto"               # auto: switch IPs without reconnecting (verified, falls back) | off
 skip_failed_minutes = 30              # don't retry a failed IP for this long (doubles per failure, 0 = off)
 explore_near_good   = true            # best-history: try untested IPs next to known-good ones sooner
+triage_batch        = 12              # filter this many candidates in parallel first (0 = one by one)
+find                = 1               # IPs that must pass the full test; the best is kept, the rest are standby
+
+[standby]
+max_age_hours = 12                    # forget standby IPs older than this
+failover      = true                  # the watchdog tries standby IPs before running a full hunt
 
 [watchdog]
 interval_seconds        = 30

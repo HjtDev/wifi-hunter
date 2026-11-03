@@ -49,6 +49,12 @@ SCHEMA: list[tuple[str, list[tuple[str, str]]]] = [
         ("live_change", "auto: switch IPs without reconnecting (verified, falls back) | off"),
         ("skip_failed_minutes", "don't retry a failed IP for this long (doubles per failure, 0 = off)"),
         ("explore_near_good", "best-history: try untested IPs next to known-good ones sooner"),
+        ("triage_batch", "filter this many candidates in parallel first (0 = one by one)"),
+        ("find", "IPs that must pass the full test; the best is kept, the rest are standby"),
+    ]),
+    ("standby", [
+        ("max_age_hours", "forget standby IPs older than this"),
+        ("failover", "the watchdog tries standby IPs before running a full hunt"),
     ]),
     ("watchdog", [
         ("interval_seconds", ""), ("probe_bytes", ""), ("bad_checks_to_rehunt", ""), ("notify", ""),
@@ -230,6 +236,7 @@ class InitResult:
     credentials_path: Path | None = None
     portal_enabled: bool = False
     notes: list[str] = field(default_factory=list)
+    shell_lines: list[str] = field(default_factory=list)
 
 
 def _ask_parsed(p: Prompter, text: str, default: str, parse: Callable[[str], object], tries: int = 5):
@@ -274,6 +281,7 @@ def run_init(
         curl_text: str | None = None,
         detect: Callable[[], Detected | None] = detect_network,
         source: Path | None = None,
+        shell_step: Callable[[Prompter], list[str]] | None = None,
 ) -> InitResult | None:
     """Interactive setup. Returns None if the user declined to overwrite an existing config."""
     values = example_values()
@@ -394,7 +402,8 @@ def run_init(
         load_config(target)
     except ConfigError as e:
         notes.append(f"The written config did not validate: {e}")
-    return InitResult(target, saved_creds, bool(v_portal["enabled"]), notes)
+    shell_lines = shell_step(p) if shell_step else []
+    return InitResult(target, saved_creds, bool(v_portal["enabled"]), notes, shell_lines)
 
 
 def _in_range(v: int, lo: int, hi: int) -> int:
