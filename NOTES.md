@@ -153,3 +153,42 @@ Decisions made where the spec was ambiguous (simplest option chosen).
 - Scoring for `best-history`: score (last 5 results, failures = 0, +-2 h of the current hour double) - 20 x busy ratio
   + 10 for an untested IP within 3 addresses of an IP scoring >= 60. Random and sequential order only get the skip rule.
 - `hunt` prints the time per candidate and the total.
+
+## Roadmap phase 2 (parallel triage, --find, standby)
+- Triage: `applier.switch_many` puts the control IP (the IP the hunt started from) plus a batch of candidates on the running
+  connection with one `nmcli device modify ipv4.addresses a/21,b/21,...` (first = primary) and checks the whole set read back.
+  There is no reconnect fallback (several addresses only exist live): "unsupported" disables triage for the rest of the hunt and
+  the batch goes back to the queue. Each probe is sent from its own address (`ping -I`, httpx `local_address`, portal login
+  bound to the source address).
+- Triage checks: gateway (2 pings), portal state (+ auto-login hook, `login_during_hunt`), loss (4 pings to ping_target,
+  limit 25%), ping (limit 2 x max_ping_ms), small download (300 KB must complete, >= 0.3 Mbps). It never accepts or ranks.
+  Survivors go through the unchanged full test one at a time (the first switch drops the extra addresses).
+- Safety nets for "multi-IP does not work here": control IP fails the gateway check, or (no control) >= 4 candidates and all
+  of them "gateway unreachable". Both disable triage and requeue the batch. Failed triage results are saved as TestResults
+  (reason = the triage reason, so "captive portal" stays neutral for the cooldown).
+- `--find N`: collect N passing IPs (default `hunt.find` = 1); best = highest score; if the best is not the active IP the hunt
+  switches back to it (live, `settle_portal`), then persists and finalizes. Others -> `standby` table (upsert by IP).
+- Standby: `standby(ip, ts, score, mac, dns_mode)`, expired after `standby.max_age_hours`. `hunter.failover()` tries up to 3
+  entries with a quick re-check (`run_all(deep=False)`), drops failures, persists the winner. The watchdog calls it after the
+  false-alarm check and budget check and before a hunt; never during a VPN.
+- Connectivity check: fast DNS/connect failures are retried twice (1 s apart) because right after a live switch the resolver
+  or routes may still be settling; timeouts are not retried. For "dead" the third tuple element is the cause, which becomes
+  `no internet: <cause>` in the result.
+
+## Roadmap phase 3 (shell command, hunt --watch, CI, README, 0.9.0)
+- `shellint.py`: a marker-delimited block (`# >>> dorm-ip >>>` ... `# <<< dorm-ip <<<`) with a *function* (not a plain alias, so it
+  also works with arguments and quoting) `uv run --quiet --project <repo> dorm-ip "$@"`. bash -> `~/.bashrc`, zsh ->
+  `$ZDOTDIR/.zshrc` or `~/.zshrc`, fish -> `conf.d/dorm-ip.fish` (the whole file is ours; fish function with `$argv`).
+  Shells offered: binary on PATH and (login shell, or its rc file / fish config dir exists). Install is idempotent (replaces the
+  block in place), backs the file up once as `<file>.dorm-ip.bak`, uninstall removes only the block (deletes the fish file).
+  The path is quoted with `shlex.quote` / a fish quoter; a test runs the real bash function with a stub `uv`.
+  `init --yes` and `--no-shell` never touch dotfiles; the step is a question per shell. When the package is not run from a
+  checkout (no `pyproject.toml` next to it) nothing is added: it is already a normal command.
+- `hunt --watch` reuses the same `_watch_loop` as `watch` (DB opened by the loop; only after a successful, non-dry-run hunt).
+  The watchdog's re-hunt now also passes `on_standby`, so `hunt.find > 1` keeps the extra IPs during automatic re-hunts.
+- CI: `.github/workflows/ci.yml` (pull requests and pushes to `main`): `uv sync`, `uv run pytest -q` on 3.12/3.13/3.14, CLI smoke
+  checks, and a wheel build that must contain `config.example.toml`. It uses `uv sync` (not `--locked`), so a stale `uv.lock`
+  after the version bump does not fail CI; run `uv lock` and commit it.
+- `tests/test_readme.py` fails if a command, option or config key is missing from the README, if the version differs between
+  `pyproject.toml`, `dorm_ip/__init__.py` and the README/CHANGELOG, or if the CI workflow / Makefile docs go missing.
+- Version 0.9.0; `dorm-ip --version` added.
