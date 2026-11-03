@@ -275,7 +275,8 @@ def test_init_end_to_end_through_the_real_prompts(tmp_path, monkeypatch):
         "",              # watchdog interval
         "",              # notifications
     ]) + "\n"
-    r = CliRunner().invoke(cli.app, ["init"], input=answers)
+    # --no-shell: this test is about the prompts above; the shell question has its own tests (test_shellint.py)
+    r = CliRunner().invoke(cli.app, ["init", "--no-shell"], input=answers)
     assert r.exit_code == 0, r.output + str(r.exception)
     target = tmp_path / "cfg" / "dorm-ip" / "config.toml"
     cfg = load_config(target)

@@ -190,3 +190,28 @@ def test_ranking_bundles_everything(d):
     d.save_scan({"172.18.40.3"}, ts=NOW)
     rk = d.ranking(30, now=NOW)
     assert rk.scores["172.18.40.1"] == 80.0 and "172.18.40.2" in rk.skip and rk.busy == {"172.18.40.3": 1.0}
+
+
+# ---- standby list (phase 2)
+def test_standby_roundtrip_ordering_and_upsert(d):
+    a, b = res("172.18.40.1", score=70.0, ts=NOW - 60), res("172.18.40.2", score=90.0, ts=NOW - 120)
+    d.save_standby([a, b])
+    assert [e.ip for e in d.standby_list(12, now=NOW)] == ["172.18.40.2", "172.18.40.1"]  # best score first
+    better = res("172.18.40.1", score=95.0, ts=NOW)
+    d.save_standby([better])
+    entries = d.standby_list(12, now=NOW)
+    assert [(e.ip, e.score) for e in entries] == [("172.18.40.1", 95.0), ("172.18.40.2", 90.0)]
+    assert entries[0].mac == "aa" and entries[0].dns_mode == "override"
+
+
+def test_standby_expires(d):
+    d.save_standby([res("172.18.40.1", ts=NOW - 13 * 3600), res("172.18.40.2", ts=NOW - 3600)])
+    assert [e.ip for e in d.standby_list(12, now=NOW)] == ["172.18.40.2"]
+    assert d.conn.execute("SELECT COUNT(*) FROM standby").fetchone()[0] == 1  # the old one is deleted, not hidden
+
+
+def test_standby_remove_and_clear(d):
+    d.save_standby([res("172.18.40.1", ts=NOW), res("172.18.40.2", ts=NOW)])
+    d.remove_standby("172.18.40.1")
+    assert [e.ip for e in d.standby_list(12, now=NOW)] == ["172.18.40.2"]
+    assert d.clear_standby() == 1 and d.standby_list(12, now=NOW) == []

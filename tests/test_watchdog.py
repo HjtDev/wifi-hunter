@@ -14,7 +14,7 @@ PROFILE = NetProfile("wlan0", "Dorm", "manual", "172.18.40.9", 21, "172.18.47.25
 
 
 def mock_client(handler):
-    return lambda timeout=None: httpx.Client(transport=httpx.MockTransport(handler))
+    return lambda timeout=None, source=None: httpx.Client(transport=httpx.MockTransport(handler))
 
 
 # ---- pure bits
@@ -345,3 +345,60 @@ def test_notifications_can_be_disabled(env):
                            sleep=lambda s: None, clock=lambda: 0.0)
     wd.notify("x")  # default notifier is a no-op when notify = false
     assert sent == []
+
+
+# ---- standby failover (phase 2)
+def make_with_failover(env, failover):
+    return watchdog.Watchdog(
+        env.cfg, db=env.db, hunt=lambda: (setattr(env, "hunts", env.hunts + 1) or env.hunt_result),
+        failover=failover, observer=env.obs, notify=env.notes_sent.append,
+        sleep=lambda s: None, clock=lambda: env.clock[0], wall=lambda: env.wall[0],
+    )
+
+
+def a_result(ip):
+    return TestResult(time.time(), ip, "aa", "override", False, True, "open", 20.0, 0.0, 1.0, 10.0, 30.0,
+                      None, None, None, 5_000_000, 70.0, True, None)
+
+
+def test_standby_failover_replaces_the_hunt(env):
+    env.healthy = False
+    wd = make_with_failover(env, lambda: a_result("172.18.40.99"))
+    wd.run(max_steps=3)
+    assert env.hunts == 0 and wd.rehunts == 0 and wd.bad == 0
+    assert any("standby IP 172.18.40.99" in n for n in env.obs.notes) and any("Switched to 172.18.40.99" in m for m in env.notes_sent)
+
+
+def test_failover_without_a_working_standby_falls_back_to_the_hunt(env):
+    env.healthy = False
+    env.hunt_result = a_result("172.18.40.77")
+    wd = make_with_failover(env, lambda: None)
+    wd.run(max_steps=3)
+    assert env.hunts == 1 and wd.rehunts == 1 and any("Trying standby IPs first" in n for n in env.obs.notes)
+
+
+def test_failover_errors_do_not_stop_the_watchdog(env):
+    env.healthy = False
+
+    def boom():
+        raise NetError("no wifi")
+
+    wd = make_with_failover(env, boom)
+    wd.run(max_steps=3)
+    assert env.hunts == 1 and any("Standby failover error" in n for n in env.obs.notes)
+
+
+def test_no_failover_function_means_the_old_behavior(env):
+    env.healthy = False
+    wd = make_with_failover(env, None)
+    wd.run(max_steps=3)
+    assert env.hunts == 1 and not any("standby" in n.lower() for n in env.obs.notes)
+
+
+def test_failover_is_not_tried_during_a_vpn(env):
+    env.tunnel = "tun0"
+    env.healthy = False
+    called = []
+    wd = make_with_failover(env, lambda: called.append(1))
+    wd.run(max_steps=6)
+    assert called == [] and env.hunts == 0

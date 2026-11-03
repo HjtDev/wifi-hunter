@@ -192,3 +192,36 @@ def test_restore_can_keep_the_backup(state):
     assert path.exists()
     applier.restore()
     assert not path.exists()
+
+
+# ---- several addresses at once (parallel triage)
+def test_apply_live_many_sets_all_addresses_first_one_primary(state):
+    applier.apply_live_many(["172.18.40.1", "172.18.40.2", "172.18.40.3"], 21, "172.18.47.254", ["8.8.8.8"], device="wlan0")
+    cmd = state[0]
+    assert cmd[1:4] == ["device", "modify", "wlan0"]
+    assert cmd[cmd.index("ipv4.addresses") + 1] == "172.18.40.1/21,172.18.40.2/21,172.18.40.3/21"
+    assert len(state) == 1  # one command, no reconnect
+
+
+def test_switch_many_verifies_the_whole_set(state, monkeypatch):
+    fake_nmcli(monkeypatch, lambda: "IP4.ADDRESS[1]:172.18.40.2/21\nIP4.ADDRESS[2]:172.18.40.1/21\n")
+    c = Clock()
+    r = applier.switch_many(["172.18.40.1", "172.18.40.2"], 21, "gw", [], target=tgt(), sleep=c.sleep, clock=c.now)
+    assert r.mode == "live"  # order does not matter
+
+
+def test_switch_many_reports_missing_addresses_without_reconnecting(state, monkeypatch):
+    fake_nmcli(monkeypatch, lambda: "IP4.ADDRESS[1]:172.18.40.1/21\n")
+    c = Clock()
+    r = applier.switch_many(["172.18.40.1", "172.18.40.2"], 21, "gw", [], target=tgt(), sleep=c.sleep, clock=c.now)
+    assert r.mode == "unsupported" and "did not appear" in r.note
+    assert not any(cmd[1:3] == ["con", "up"] for cmd in state)  # there is no reconnect fallback for this
+
+
+def test_switch_many_handles_nmcli_errors_and_no_device(monkeypatch):
+    def refuse(cmd, timeout=30):
+        raise netinfo.NetError("not connected")
+
+    monkeypatch.setattr(netinfo, "run", refuse)
+    assert applier.switch_many(["172.18.40.1"], 21, "gw", [], target=tgt()).mode == "unsupported"
+    assert applier.switch_many(["172.18.40.1"], 21, "gw", [], target=applier.Target("Dorm", "")).mode == "unsupported"

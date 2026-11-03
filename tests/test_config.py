@@ -128,3 +128,36 @@ def test_example_config_has_the_new_keys():
 
     h = wizard.example_values()["hunt"]
     assert h["live_change"] == "auto" and h["skip_failed_minutes"] == 30 and h["explore_near_good"] is True
+
+
+def test_phase2_settings(tmp_path):
+    cfg = load_config(write(tmp_path, BASE))
+    assert cfg.hunt.triage_batch == 12 and cfg.hunt.find == 1
+    assert cfg.standby.max_age_hours == 12 and cfg.standby.failover is True
+    with pytest.raises(ConfigError, match="triage_batch"):
+        load_config(write(tmp_path, BASE + "[hunt]\ntriage_batch = 99\n"))
+    with pytest.raises(ConfigError, match="find"):
+        load_config(write(tmp_path, BASE + "[hunt]\nfind = 0\n"))
+    off = load_config(write(tmp_path, BASE + "[hunt]\ntriage_batch = 0\nfind = 3\n[standby]\nfailover = false\n"))
+    assert off.hunt.triage_batch == 0 and off.hunt.find == 3 and off.standby.failover is False
+
+
+def test_overrides_for_find_and_triage(tmp_path):
+    cfg = with_overrides(load_config(write(tmp_path, BASE)), find=3, triage_batch=0)
+    assert cfg.hunt.find == 3 and cfg.hunt.triage_batch == 0
+
+
+def test_example_config_has_the_phase2_keys():
+    from dorm_ip import wizard
+
+    v = wizard.example_values()
+    assert v["hunt"]["triage_batch"] == 12 and v["hunt"]["find"] == 1 and v["standby"]["failover"] is True
+    assert tomllib_roundtrip(v)
+
+
+def tomllib_roundtrip(values):
+    import tomllib
+
+    from dorm_ip import wizard
+
+    return tomllib.loads(wizard.render_config(values)) == values
