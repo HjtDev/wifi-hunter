@@ -24,6 +24,9 @@ SCHEMA = """
          CREATE TABLE IF NOT EXISTS daily_usage (day TEXT PRIMARY KEY, bytes INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE IF NOT EXISTS scan_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL);
          CREATE TABLE IF NOT EXISTS scan_hits (run_id INTEGER NOT NULL, ip TEXT NOT NULL, PRIMARY KEY (run_id, ip));
+         CREATE TABLE IF NOT EXISTS standby (
+                                                ip TEXT PRIMARY KEY, ts REAL NOT NULL, score REAL, mac TEXT, dns_mode TEXT
+         );
          CREATE TABLE IF NOT EXISTS checks (
                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                ts REAL NOT NULL, ip TEXT, mac TEXT, gateway_ok INTEGER, loss_pct REAL, rtt_ms REAL,
@@ -46,6 +49,15 @@ def db_path() -> Path:
 
 def _day(ts: float | None = None) -> str:
     return (datetime.fromtimestamp(ts) if ts is not None else datetime.now()).strftime("%Y-%m-%d")
+
+
+@dataclass
+class StandbyEntry:
+    ip: str
+    ts: float  # when it passed the full test
+    score: float
+    mac: str
+    dns_mode: str
 
 
 @dataclass
@@ -226,6 +238,35 @@ class DB:
                 if left > 0:
                     skip[ip] = left
         return Ranking(self.scores(hour=hour), skip, self.busy_ratio())
+
+    # ------------------------------------------------------------ standby
+
+    def save_standby(self, results: list[TestResult]) -> None:
+        """Remember IPs that passed the full test but are not the active one."""
+        with self.conn:
+            for r in results:
+                self.conn.execute(
+                    "INSERT INTO standby(ip, ts, score, mac, dns_mode) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(ip) DO UPDATE SET ts=excluded.ts, score=excluded.score, mac=excluded.mac, "
+                    "dns_mode=excluded.dns_mode",
+                    (r.ip, r.ts, r.score, r.mac, r.dns_mode),
+                )
+
+    def standby_list(self, max_age_hours: float, now: float | None = None) -> list[StandbyEntry]:
+        """Fresh standby IPs, best score first (expired ones are deleted)."""
+        now = time.time() if now is None else now
+        with self.conn:
+            self.conn.execute("DELETE FROM standby WHERE ts < ?", (now - max_age_hours * 3600,))
+        rows = self.conn.execute("SELECT * FROM standby ORDER BY score DESC, ts DESC")
+        return [StandbyEntry(r["ip"], r["ts"], r["score"] or 0.0, r["mac"] or "", r["dns_mode"] or "") for r in rows]
+
+    def remove_standby(self, ip: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM standby WHERE ip = ?", (ip,))
+
+    def clear_standby(self) -> int:
+        with self.conn:
+            return self.conn.execute("DELETE FROM standby").rowcount
 
     # ------------------------------------------------------------ history
 

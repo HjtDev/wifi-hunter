@@ -144,6 +144,57 @@ def apply_live(
     _nm(["device", "modify", device, *_static_args(ip, prefix, gateway, dns)], dry_run)
 
 
+def apply_live_many(
+        ips: list[str], prefix: int, gateway: str, dns: list[str], *, device: str, dry_run: bool = False
+) -> None:
+    """Put several addresses on the running connection at once (the first one is the primary)."""
+    args = _static_args(ips[0], prefix, gateway, dns)
+    args[args.index("ipv4.addresses") + 1] = ",".join(f"{ip}/{prefix}" for ip in ips)
+    _nm(["device", "modify", device, *args], dry_run)
+
+
+def verify_live_set(
+        ips: list[str],
+        device: str,
+        *,
+        timeout: float = 2.0,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """True once the device has exactly these IPv4 addresses."""
+    deadline = clock() + timeout
+    while True:
+        if sorted(netinfo.live_addresses(device)) == sorted(ips):
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(0.1)
+
+
+def switch_many(
+        ips: list[str],
+        prefix: int,
+        gateway: str,
+        dns: list[str],
+        *,
+        target: Target,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+) -> SwitchResult:
+    """Add all `ips` to the running connection and check that they are all there.
+
+    There is no reconnect fallback: several addresses only exist live. mode is "live" or "unsupported"."""
+    if not target.device:
+        return SwitchResult("unsupported", "no interface to put several addresses on")
+    try:
+        apply_live_many(ips, prefix, gateway, dns, device=target.device)
+        if verify_live_set(ips, target.device, sleep=sleep, clock=clock):
+            return SwitchResult("live")
+        return SwitchResult("unsupported", "the extra addresses did not appear on the running connection")
+    except NetError as e:
+        return SwitchResult("unsupported", str(e))
+
+
 def persist_static(
         ip: str, prefix: int, gateway: str, dns: list[str], *, connection: str, dry_run: bool = False
 ) -> None:

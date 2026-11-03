@@ -124,7 +124,9 @@ class ResolvingTransport(httpx.BaseTransport):
         self.inner.close()
 
 
-def make_client(cfg: PortalCfg, dorm_dns: list[str] | None = None) -> httpx.Client:
+def make_client(
+        cfg: PortalCfg, dorm_dns: list[str] | None = None, source_ip: str | None = None
+) -> httpx.Client:
     portal_host = urlsplit(cfg.url).hostname or ""
 
     def resolver(host: str) -> str | None:
@@ -134,7 +136,7 @@ def make_client(cfg: PortalCfg, dorm_dns: list[str] | None = None) -> httpx.Clie
             return dnsq.resolve_via(dorm_dns, host)
         return None
 
-    transport = ResolvingTransport(httpx.HTTPTransport(verify=cfg.verify_tls), resolver)
+    transport = ResolvingTransport(httpx.HTTPTransport(verify=cfg.verify_tls, local_address=source_ip), resolver)
     return httpx.Client(transport=transport, follow_redirects=True, timeout=cfg.timeout, trust_env=False)
 
 
@@ -145,6 +147,7 @@ def login_detail(
         mac: str = "",
         client: httpx.Client | None = None,
         dorm_dns: list[str] | None = None,
+        source_ip: str | None = None,
 ) -> tuple[bool, str]:
     """-> (success, short reason). The reason never contains credentials.
 
@@ -158,7 +161,7 @@ def login_detail(
         return False, str(e)
 
     own = client is None
-    c = client or make_client(cfg, dorm_dns)
+    c = client or make_client(cfg, dorm_dns, source_ip)
     try:
         r = c.request(**req)
         body = r.text
@@ -184,9 +187,10 @@ def login(
         mac: str = "",
         client: httpx.Client | None = None,
         dorm_dns: list[str] | None = None,
+        source_ip: str | None = None,
 ) -> bool:
     """Replay the portal login. Single plug-in point used by hunter.finalize and the watchdog."""
-    return login_detail(session_cfg, ip=ip, mac=mac, client=client, dorm_dns=dorm_dns)[0]
+    return login_detail(session_cfg, ip=ip, mac=mac, client=client, dorm_dns=dorm_dns, source_ip=source_ip)[0]
 
 
 # ---------------------------------------------------------------- "Copy as cURL" import

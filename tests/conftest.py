@@ -23,3 +23,15 @@ def cfg(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(CFG)
     return load_config(p)
+
+
+@pytest.fixture(autouse=True)
+def isolated_environment(tmp_path_factory, monkeypatch):
+    """No test may depend on, or write to, the developer's real home, shell or XDG folders.
+
+    (A test once passed on a machine without $SHELL and failed on one with it: `init` found the login
+    shell and asked a question.) Tests that need a particular shell or home set their own after this."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    for var in ("SHELL", "ZDOTDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "VISUAL", "EDITOR"):
+        monkeypatch.delenv(var, raising=False)

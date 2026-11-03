@@ -184,3 +184,81 @@ def test_set_reports_when_live_switching_does_not_work(run_cli, monkeypatch):
     flat = " ".join(r.output.split())
     assert r.exit_code == 0 and "not working here" in flat and "reconnected" in flat
     assert run_cli.calls["persist"] == []  # the reconnect path already saved the profile
+
+
+# ---- hunt flags and the standby command (phase 2)
+def test_hunt_flags_reach_the_config(run_cli, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(hunter, "hunt", lambda cfg, **k: seen.update(cfg=cfg, kw=k) or None)
+    r = run_cli("hunt", "--find", "3", "--no-triage", "--max", "7")
+    assert r.exit_code == 1  # nothing passed (stub)
+    assert seen["cfg"].hunt.find == 3 and seen["cfg"].hunt.triage_batch == 0 and seen["cfg"].hunt.max_candidates == 7
+    assert callable(seen["kw"]["on_standby"]) and callable(seen["kw"]["on_scan"])
+
+
+def test_hunt_without_flags_keeps_the_config_values(run_cli, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(hunter, "hunt", lambda cfg, **k: seen.update(cfg=cfg) or None)
+    run_cli("hunt")
+    assert seen["cfg"].hunt.find == 1 and seen["cfg"].hunt.triage_batch == 12
+
+
+def test_standby_command_lists_and_clears(run_cli):
+    import time as _t
+
+    from dorm_ip.db import open_db
+    from dorm_ip.models import TestResult
+
+    assert "No standby IPs" in run_cli("standby").output
+    with open_db() as d:
+        d.save_standby([TestResult(_t.time(), "172.18.40.8", "aa", "override", False, True, "open", 20.0, 0.0, 1.0, 10.0,
+                                   30.0, None, None, None, 1, 88.0, True, None)])
+    out = run_cli("standby").output
+    assert "172.18.40.8" in out and "88" in out and "standby.max_age_hours" in " ".join(out.split())
+    assert "Removed 1" in run_cli("standby", "--clear").output
+    assert "No standby IPs" in run_cli("standby").output
+
+
+# ---- hunt --watch (phase 3)
+def test_hunt_watch_starts_the_watchdog_after_a_good_ip(run_cli, monkeypatch):
+    from dorm_ip.models import TestResult as TR
+    import time as _t
+
+    good = TR(_t.time(), "172.18.40.8", "aa", "override", False, True, "open", 20.0, 0.0, 1.0, 10.0, 30.0,
+              25.0, 20.0, None, 1, 88.0, True, None)
+    monkeypatch.setattr(hunter, "hunt", lambda cfg, **k: good)
+    started = []
+    monkeypatch.setattr(cli, "_watch_loop", lambda st, cfg: started.append(cfg))
+    r = run_cli("hunt", "--watch")
+    assert r.exit_code == 0 and len(started) == 1 and "Starting the watchdog" in r.output
+
+
+def test_hunt_without_watch_does_not_start_it(run_cli, monkeypatch):
+    from dorm_ip.models import TestResult as TR
+    import time as _t
+
+    good = TR(_t.time(), "172.18.40.8", "aa", "override", False, True, "open", 20.0, 0.0, 1.0, 10.0, 30.0,
+              25.0, 20.0, None, 1, 88.0, True, None)
+    monkeypatch.setattr(hunter, "hunt", lambda cfg, **k: good)
+    monkeypatch.setattr(cli, "_watch_loop", lambda st, cfg: pytest.fail("must not start"))
+    assert run_cli("hunt").exit_code == 0
+
+
+def test_hunt_watch_does_not_start_when_nothing_passed(run_cli, monkeypatch):
+    monkeypatch.setattr(hunter, "hunt", lambda cfg, **k: None)
+    monkeypatch.setattr(cli, "_watch_loop", lambda st, cfg: pytest.fail("must not start"))
+    assert run_cli("hunt", "--watch").exit_code == 1
+
+
+def test_hunt_watch_dry_run_only_says_what_it_would_do(run_cli, monkeypatch):
+    monkeypatch.setattr(hunter, "hunt", lambda cfg, **k: None)
+    monkeypatch.setattr(cli, "_watch_loop", lambda st, cfg: pytest.fail("must not start"))
+    r = run_cli("--dry-run", "hunt", "--watch")
+    assert r.exit_code == 0 and "would start the watchdog" in r.output
+
+
+def test_watch_command_and_hunt_watch_share_one_loop(run_cli, monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli, "_watch_loop", lambda st, cfg: seen.append(cfg.watchdog.notify))
+    run_cli("watch", "--no-notify")
+    assert seen == [False]

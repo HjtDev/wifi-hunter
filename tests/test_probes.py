@@ -30,7 +30,7 @@ def test_parse_ping():
 
 # ---- portal
 def mock_client(handler):
-    return lambda timeout=None: httpx.Client(transport=httpx.MockTransport(handler))
+    return lambda timeout=None, source=None: httpx.Client(transport=httpx.MockTransport(handler))
 
 
 def test_classify_portal():
@@ -249,3 +249,88 @@ def test_run_all_portal_login_failure_still_fails(cfg, monkeypatch):
     monkeypatch.setattr(nt, "check_portal", lambda c: ("portal", 800, "http://p/"))
     r = nt.run_all(cfg, "x", "override", profile=PROFILE, on_portal=lambda: False)
     assert not r.passed and "login required" in r.fail_reason
+
+
+# ---- connectivity check: why it failed, and not failing for a race (phase 1/2 fixes)
+def test_describe_error_classes():
+    assert nt.describe_error(httpx.ConnectTimeout("t")) == ("no answer within 5 s (connection timed out)", False)
+    assert nt.describe_error(httpx.ReadTimeout("t")) == ("no answer within 5 s (connection timed out)", False)
+    assert nt.describe_error(httpx.ConnectError("[Errno -2] Name or service not known")) == ("DNS lookup failed", True)
+    assert nt.describe_error(httpx.ConnectError("[Errno 101] Network is unreachable"))[1] is True
+    assert nt.describe_error(httpx.RemoteProtocolError("reset")) == ("connection reset", True)
+
+
+def test_fast_failures_are_retried_until_dns_settles(cfg, monkeypatch):
+    attempts = []
+
+    def handler(req):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise httpx.ConnectError("[Errno -3] Temporary failure in name resolution")
+        return httpx.Response(204)
+
+    monkeypatch.setattr(nt, "_client", mock_client(handler))
+    slept = []
+    assert nt.check_portal(cfg, sleep=slept.append)[0] == "open" and len(attempts) == 3 and slept == [1.0, 1.0]
+
+
+def test_a_timeout_is_not_retried_and_says_so(cfg, monkeypatch):
+    attempts = []
+
+    def handler(req):
+        attempts.append(1)
+        raise httpx.ConnectTimeout("t")
+
+    monkeypatch.setattr(nt, "_client", mock_client(handler))
+    state, _n, why = nt.check_portal(cfg, sleep=lambda s: pytest.fail("must not wait"))
+    assert state == "dead" and len(attempts) == 1 and "timed out" in why
+
+
+def test_persistent_fast_failure_gives_up_after_the_retries(cfg, monkeypatch):
+    attempts = []
+
+    def handler(req):
+        attempts.append(1)
+        raise httpx.ConnectError("Name or service not known")
+
+    monkeypatch.setattr(nt, "_client", mock_client(handler))
+    assert nt.check_portal(cfg, sleep=lambda s: None) == ("dead", 0, "DNS lookup failed") and len(attempts) == 3
+
+
+def test_run_all_reports_why_there_is_no_internet(cfg, monkeypatch):
+    stub(monkeypatch, portal=("dead", 0, "no answer within 5 s (connection timed out)"))
+    r = nt.run_all(cfg, "x", "override", profile=PROFILE)
+    assert r.fail_reason == "no internet: no answer within 5 s (connection timed out)" and r.score == 0
+
+
+def test_run_all_without_detail_keeps_the_generic_reason(cfg, monkeypatch):
+    stub(monkeypatch, portal=("dead", 0, None))
+    assert "no internet" in nt.run_all(cfg, "x", "override", profile=PROFILE).fail_reason
+
+
+def test_ping_can_be_sent_from_a_source_address(monkeypatch):
+    seen = []
+
+    class P:
+        stdout = PING_OK
+
+    monkeypatch.setattr(nt.subprocess, "run", lambda cmd, **k: seen.append(cmd) or P())
+    nt.ping("1.1.1.1", 3, source="172.18.40.9")
+    nt.ping("1.1.1.1", 3)
+    assert seen[0][-3:] == ["-I", "172.18.40.9", "1.1.1.1"] and "-I" not in seen[1]
+
+
+def test_small_download(cfg, monkeypatch):
+    seen = []
+
+    def handler(req):
+        seen.append(str(req.url))
+        return httpx.Response(200, content=b"x" * 300_000)
+
+    monkeypatch.setattr(nt, "_client", mock_client(handler))
+    ok, got, mbps = nt.small_download(cfg, 300_000, source="172.18.40.9")
+    assert ok and got == 300_000 and mbps > 0 and seen[0].endswith("bytes=300000")
+    monkeypatch.setattr(nt, "_client", mock_client(lambda r: httpx.Response(503)))
+    assert nt.small_download(cfg, 300_000) == (False, 0, None)
+    monkeypatch.setattr(nt, "_client", mock_client(lambda r: httpx.Response(200, content=b"x" * 1000)))
+    assert nt.small_download(cfg, 300_000)[0] is False  # short body = incomplete
