@@ -690,30 +690,38 @@ def _watch_loop(st: State, cfg: Config) -> None:
 def login(
         ctx: typer.Context,
         force: Annotated[bool, typer.Option("--force", help="Log in even if the portal already looks open.")] = False,
+        debug: Annotated[bool, typer.Option("--debug", help="Show every step of the login (no secrets in the output).")] = False,
 ) -> None:
-    """Replay the portal login request configured in the portal section of config.toml."""
+    """Log in to the captive portal (follows its login page, or replays your request: see portal.mode)."""
     st: State = ctx.obj
     cfg = st.load()
+    p = cfg.portal
     if st.dry_run:
-        p = cfg.portal
-        out.print(
-            f"[dry-run] would send {p.method} {p.url} with fields: {', '.join(p.fields) or '(none)'}",
-            markup=False, highlight=False,
+        what = (
+            f"open the portal's login page via {cfg.tests.connectivity_url} and submit its form"
+            if p.mode == "flow" else f"send {p.method} {p.url} with fields: {', '.join(p.fields) or '(none)'}"
         )
+        out.print(f"[dry-run] would {what}", markup=False, highlight=False)
         return
     profile = netinfo.get_profile(cfg.network.interface, cfg.network.connection)
-    state, _b, _loc = nettests.check_portal(cfg)
-    out.print(f"Portal state: {state}")
+    state, _b, extra = nettests.check_portal(cfg)
+    out.print(f"Portal state: {state}" + (f" (login page: {extra})" if state == "portal" and extra else ""), markup=False)
     if state == "open" and not force:
         out.print("Already open; nothing to do (use --force to log in anyway).")
         return
-    ok, detail = portal.login_detail(cfg.portal, ip=profile.ip or "", mac=profile.mac)
-    out.print(("Login request sent: " if ok else "[red]Login failed:[/red] ") + escape(detail))
+    ok, detail, trace = portal.login_trace(
+        p, dorm_dns=cfg.dns.default, source_ip=profile.ip or None, connectivity_url=cfg.tests.connectivity_url
+    )
+    if debug or not ok:
+        for line in trace:
+            out.print(line, markup=False, highlight=False)
+    out.print(("[green]Logged in:[/green] " if ok else "[red]Login failed:[/red] ") + escape(detail))
+    if not ok and not debug and trace:
+        err.print("Run `dorm-ip login --debug` for the full trace.")
     state = nettests.check_portal(cfg)[0]
     out.print(f"Portal state now: {state}")
     if not ok or state != "open":
         raise SystemExit(1)
-
 
 
 @app.command("live-check")

@@ -102,10 +102,10 @@ def describe_error(e: Exception) -> tuple[str, bool]:
     return f"network error ({type(e).__name__})", True
 
 
-def _check_once(cfg: Config, source: str | None) -> tuple[str, int, str | None, bool]:
+def _check_once(url: str, source: str | None) -> tuple[str, int, str | None, bool]:
     try:
         with _client(httpx.Timeout(5.0), source) as c:
-            r = c.get(cfg.tests.connectivity_url)
+            r = c.get(url)
             body = r.content[:4096]
             state = classify_portal(r.status_code, r.headers.get("content-type", ""), body)
             return state, len(r.content), r.headers.get("location"), False
@@ -114,8 +114,8 @@ def _check_once(cfg: Config, source: str | None) -> tuple[str, int, str | None, 
         return "dead", 0, text, fast
 
 
-def check_portal(
-        cfg: Config, source: str | None = None, *, retries: int = 2, sleep: Callable[[float], None] = time.sleep
+def check_url(
+        url: str, source: str | None = None, *, retries: int = 2, sleep: Callable[[float], None] = time.sleep
 ) -> tuple[str, int, str | None]:
     """-> (state, bytes_used, extra). state: open | portal | dead.
 
@@ -124,11 +124,18 @@ def check_portal(
     connect error) is retried up to `retries` times, 1 s apart; a timeout is not (the path is blocked).
     """
     for attempt in range(retries + 1):
-        state, nbytes, extra, fast = _check_once(cfg, source)
+        state, nbytes, extra, fast = _check_once(url, source)
         if state != "dead" or not fast or attempt == retries:
             break
         sleep(1.0)
     return state, nbytes, extra
+
+
+def check_portal(
+        cfg: Config, source: str | None = None, *, retries: int = 2, sleep: Callable[[float], None] = time.sleep
+) -> tuple[str, int, str | None]:
+    """The connectivity check against `tests.connectivity_url` (see check_url)."""
+    return check_url(cfg.tests.connectivity_url, source, retries=retries, sleep=sleep)
 
 
 def quick_speed(cfg: Config, max_seconds: float = 20.0) -> tuple[float | None, int]:

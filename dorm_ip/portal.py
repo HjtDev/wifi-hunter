@@ -12,11 +12,14 @@ import ipaddress
 import json
 import re
 import shlex
+import socket
+import time
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import parse_qsl, quote, urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -140,6 +143,41 @@ def make_client(
     return httpx.Client(transport=transport, follow_redirects=True, timeout=cfg.timeout, trust_env=False)
 
 
+DEFAULT_CONNECTIVITY_URL = "http://connectivitycheck.gstatic.com/generate_204"
+
+
+def _login_flow(
+        cfg: PortalCfg, *, dorm_dns, source_ip, client, connectivity_url: str, trace: list[str] | None = None
+) -> tuple[bool, str]:
+    from . import tests as nettests  # imported late: nothing at module level depends on it
+
+    def verify() -> tuple[str, str | None]:
+        state, _bytes, extra = nettests.check_url(connectivity_url, source_ip)
+        return state, extra
+
+    return flow_login(
+        cfg, connectivity_url=connectivity_url, dorm_dns=dorm_dns, source_ip=source_ip, client=client,
+        trace=trace, verify=verify,
+    )
+
+
+def login_trace(
+        cfg: PortalCfg, *, dorm_dns: list[str] | None = None, source_ip: str | None = None,
+        connectivity_url: str = DEFAULT_CONNECTIVITY_URL, client: httpx.Client | None = None,
+) -> tuple[bool, str, list[str]]:
+    """Like login_detail, plus a step-by-step trace with no credentials in it (for `login --debug`)."""
+    if not cfg.enabled:
+        return False, "auto-login is not enabled (portal.enabled = false)", []
+    if cfg.mode != "flow":
+        ok, detail = login_detail(cfg, dorm_dns=dorm_dns, source_ip=source_ip, client=client)
+        return ok, detail, [f"replay mode: {cfg.method} {_short(cfg.url)} -> {detail}"]
+    trace: list[str] = []
+    ok, detail = _login_flow(
+        cfg, dorm_dns=dorm_dns, source_ip=source_ip, client=client, connectivity_url=connectivity_url, trace=trace
+    )
+    return ok, detail, trace
+
+
 def login_detail(
         cfg: PortalCfg | None,
         *,
@@ -148,6 +186,7 @@ def login_detail(
         client: httpx.Client | None = None,
         dorm_dns: list[str] | None = None,
         source_ip: str | None = None,
+        connectivity_url: str = DEFAULT_CONNECTIVITY_URL,
 ) -> tuple[bool, str]:
     """-> (success, short reason). The reason never contains credentials.
 
@@ -155,6 +194,8 @@ def login_detail(
     login works while the system DNS is the override DNS."""
     if cfg is None or not cfg.enabled:
         return False, "auto-login is not enabled (portal.enabled = false)"
+    if cfg.mode == "flow":
+        return _login_flow(cfg, dorm_dns=dorm_dns, source_ip=source_ip, client=client, connectivity_url=connectivity_url)
     try:
         req = build_request(cfg, load_credentials(cfg), ip, mac)
     except PortalError as e:
@@ -191,6 +232,289 @@ def login(
 ) -> bool:
     """Replay the portal login. Single plug-in point used by hunter.finalize and the watchdog."""
     return login_detail(session_cfg, ip=ip, mac=mac, client=client, dorm_dns=dorm_dns, source_ip=source_ip)[0]
+
+
+# ---------------------------------------------------------------- flow mode (what a browser does)
+
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+LOCAL_SUFFIXES = (".local", ".lan", ".internal", ".localdomain", ".home.arpa")
+REDIRECTS = (301, 302, 303, 307, 308)
+VERIFY_TRIES = 4
+MAX_PORTAL_HOPS = 4
+
+# Portals recognised when their login page has no <form> we can parse (the page is built by JavaScript).
+KERIO = {
+    "name": "Kerio Control",
+    "post_path": "/internal/dologin.php",
+    "user_field": "kerio_username",
+    "pass_field": "kerio_password",
+}
+
+
+@dataclass
+class FormField:
+    name: str
+    type: str
+    value: str = ""
+    checked: bool = False
+
+
+@dataclass
+class Form:
+    action: str
+    method: str
+    fields: list[FormField] = field(default_factory=list)
+
+
+class _FormParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forms: list[Form] = []
+        self._cur: Form | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "form":
+            self._cur = Form(a.get("action", ""), (a.get("method") or "get").lower())
+            self.forms.append(self._cur)
+        elif tag == "input" and self._cur is not None:
+            self._cur.fields.append(
+                FormField(a.get("name", ""), (a.get("type") or "text").lower(), a.get("value", ""), "checked" in a)
+            )
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form":
+            self._cur = None
+
+
+def parse_forms(html: str) -> list[Form]:
+    parser = _FormParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:  # broken markup: use whatever was parsed so far
+        pass
+    return parser.forms
+
+
+def pick_login_form(forms: list[Form]) -> Form | None:
+    """The first form that has a password input."""
+    return next((f for f in forms if any(i.type == "password" for i in f.fields)), None)
+
+
+_USER_HINTS = ("user", "login", "name", "mail", "phone", "account")
+
+
+def fill_form(form: Form, username: str, password: str, user_field: str = "", pass_field: str = "") -> dict[str, str]:
+    """What a browser would submit: hidden and default values as they are, plus the credentials."""
+    pw_name = pass_field or next((f.name for f in form.fields if f.type == "password" and f.name), "")
+    if not pw_name:
+        raise PortalError("the login form has no named password field")
+    user_name = user_field
+    if not user_name:
+        texts = [f.name for f in form.fields if f.type in ("text", "email", "tel", "number") and f.name]
+        user_name = next((n for n in texts if any(h in n.lower() for h in _USER_HINTS)), texts[0] if texts else "")
+    if not user_name:
+        raise PortalError("cannot tell which form field takes the username (set portal.form_username_field)")
+    data: dict[str, str] = {}
+    for f in form.fields:
+        if not f.name or f.type in ("submit", "button", "image", "reset", "file"):
+            continue
+        if f.type in ("checkbox", "radio"):
+            if f.checked:
+                data[f.name] = f.value or "on"
+            continue
+        data[f.name] = f.value
+    data[user_name], data[pw_name] = username, password
+    return data
+
+
+def derive_post_url(login_url: str, post_path: str, drop: list[str]) -> str:
+    """Submit address built from the login page address: same host and query, new path.
+
+    The raw query string is kept as it is (only the dropped parameters are removed), because values such as
+    base64 tokens contain characters that decoding and re-encoding would damage."""
+    u = urlsplit(login_url)
+    query = "&".join(p for p in u.query.split("&") if p and p.split("=", 1)[0] not in drop)
+    return urlunsplit((u.scheme, u.netloc, post_path, query, ""))
+
+
+def known_portal(login_url: str, server_header: str | None) -> dict | None:
+    u = urlsplit(login_url)
+    keys = {p.split("=", 1)[0] for p in u.query.split("&")}
+    if "kerio" in (server_header or "").lower() or (u.path.startswith("/login") and {"NTLM", "dest"} <= keys):
+        return KERIO
+    return None
+
+
+def _is_local_name(host: str) -> bool:
+    return "." not in host or host.lower().endswith(LOCAL_SUFFIXES)
+
+
+def make_flow_resolver(
+        cfg: PortalCfg, dorm_dns: list[str] | None, portal_hosts: set[str], note: Callable[[str], None]
+) -> Callable[[str], str | None]:
+    """Portal host and local names -> the dorm DNS (system resolvers often send *.local to mDNS only);
+    everything else keeps using the system DNS, falling back to the dorm DNS if that fails."""
+
+    def resolver(host: str) -> str | None:
+        if cfg.host_ip and host in portal_hosts:
+            note(f"   {host} -> {cfg.host_ip} (portal.host_ip)")
+            return cfg.host_ip
+        if not cfg.resolve_via_dorm_dns or not dorm_dns:
+            return None
+        if host in portal_hosts or _is_local_name(host):
+            ip = dnsq.resolve_via(dorm_dns, host)
+            note(f"   {host} -> {ip or 'no answer'} (dorm DNS)")
+            return ip
+        try:
+            socket.getaddrinfo(host, None, socket.AF_INET)
+            return None  # the system DNS can resolve it
+        except OSError:
+            ip = dnsq.resolve_via(dorm_dns, host)
+            note(f"   {host} -> {ip or 'no answer'} (dorm DNS, the system DNS failed)")
+            return ip
+
+    return resolver
+
+
+def _flow_client(
+        cfg: PortalCfg, dorm_dns: list[str] | None, source_ip: str | None, portal_hosts: set[str], note
+) -> httpx.Client:
+    transport = ResolvingTransport(
+        httpx.HTTPTransport(verify=cfg.verify_tls, local_address=source_ip),
+        make_flow_resolver(cfg, dorm_dns, portal_hosts, note),
+    )
+    return httpx.Client(
+        transport=transport, follow_redirects=True, max_redirects=6, timeout=cfg.timeout,
+        trust_env=False, headers=BROWSER_HEADERS,
+    )
+
+
+def _short(url: str, limit: int = 110) -> str:
+    return url if len(url) <= limit else url[: limit - 1] + "…"
+
+
+def flow_login(
+        cfg: PortalCfg,
+        *,
+        connectivity_url: str,
+        dorm_dns: list[str] | None = None,
+        source_ip: str | None = None,
+        client: httpx.Client | None = None,
+        trace: list[str] | None = None,
+        verify: Callable[[], tuple[str, str | None]] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+) -> tuple[bool, str]:
+    """Log in the way a browser does, then judge the result by whether the internet opened.
+
+    1. Ask for the connectivity URL: an unauthenticated client is redirected to the portal's login page, and
+       that address carries fresh per-client values (so nothing is ever copied from an old session).
+    2. Load the login page (this sets the session cookies) and find its form.
+    3. Submit the form with the credentials, from the same source address, with the cookies.
+    4. Verify with the connectivity check; the portal's own response codes are not trusted.
+    `verify` returns (state, detail) of that check (state: open | portal | dead)."""
+    note = trace.append if trace is not None else (lambda _m: None)
+    try:
+        creds = load_credentials(cfg)
+    except PortalError as e:
+        return False, str(e)
+    portal_hosts: set[str] = set()
+    own = client is None
+    http = client or _flow_client(cfg, dorm_dns, source_ip, portal_hosts, note)
+    try:
+        # ---- 1. where does the portal send us?
+        r = http.get(connectivity_url, follow_redirects=False)
+        loc = r.headers.get("location")
+        note(f"1. GET {_short(connectivity_url)} -> HTTP {r.status_code}" + (f", redirected to {_short(loc)}" if loc else ""))
+        if r.status_code == 204:
+            return True, "the internet is already open: no login needed"
+        if r.status_code in REDIRECTS and loc:
+            login_url = urljoin(str(r.url), loc)
+        elif "html" in r.headers.get("content-type", "").lower() and "<form" in r.text.lower():
+            login_url = str(r.url)  # the portal answered with its login page directly
+        else:
+            return False, f"the connectivity check returned HTTP {r.status_code}, not a portal redirect"
+        portal_host = urlsplit(login_url).hostname or ""
+        portal_hosts.add(portal_host)
+
+        # ---- 2. the login page
+        page = http.get(login_url)
+        page_url = str(page.url)
+        note(f"2. GET {_short(page_url)} -> HTTP {page.status_code} {page.headers.get('content-type', '')}")
+        note("   cookies: " + (", ".join(sorted({c.name for c in http.cookies.jar})) or "none"))
+        if page.status_code >= 400:
+            return False, f"the portal's login page answered HTTP {page.status_code}"
+        form = pick_login_form(parse_forms(page.text))
+        known = known_portal(page_url, page.headers.get("server"))
+        if form is not None:
+            post_url = urljoin(page_url, form.action) if form.action else page_url
+            method = form.method
+            data = fill_form(form, creds[0], creds[1], cfg.form_username_field, cfg.form_password_field)
+            note(f"   form: {method.upper()} {_short(post_url)}; fields: " + ", ".join(
+                f"{f.name} ({f.type})" for f in form.fields if f.name))
+        else:
+            post_path = cfg.post_path or (known or {}).get("post_path", "")
+            user_f = cfg.form_username_field or (known or {}).get("user_field", "")
+            pass_f = cfg.form_password_field or (known or {}).get("pass_field", "")
+            if not (post_path and user_f and pass_f):
+                return False, (
+                    "no login form found on the portal page and no portal.post_path / form field names configured: "
+                    "run `dorm-ip login --debug` and send the trace"
+                )
+            post_url = derive_post_url(page_url, post_path, cfg.post_drop_params)
+            method, data = "post", {user_f: creds[0], pass_f: creds[1]}
+            note(f"   no parsable form; using {known['name'] if known and not cfg.post_path else 'portal.post_path'}: "
+                 f"POST {_short(post_url)}; fields: {user_f}, {pass_f}")
+
+        # ---- 3. submit
+        origin = "{0.scheme}://{0.netloc}".format(urlsplit(page_url))
+        headers = {"Referer": page_url, "Origin": origin}
+        if method == "post":
+            resp = http.post(post_url, data=data, headers=headers, follow_redirects=False)
+        else:
+            resp = http.get(post_url, params=data, headers=headers, follow_redirects=False)
+        hops = 0
+        while resp.status_code in REDIRECTS and resp.headers.get("location") and hops < MAX_PORTAL_HOPS:
+            nxt = urljoin(str(resp.url), resp.headers["location"])
+            note(f"3. {resp.request.method} {_short(str(resp.url))} -> HTTP {resp.status_code}, redirected to {_short(nxt)}")
+            if (urlsplit(nxt).hostname or "") not in portal_hosts:
+                break  # leaving the portal (back to the page you asked for): the login is done or has failed
+            resp = http.get(nxt, headers=headers, follow_redirects=False)
+            hops += 1
+        final_loc = resp.headers.get("location", "")
+        note(f"3. {resp.request.method} {_short(str(resp.url))} -> HTTP {resp.status_code}"
+             + (f", redirected to {_short(final_loc)}" if final_loc else ""))
+        rejected = "reason=failure" in final_loc or "reason=failure" in str(resp.url)
+
+        # ---- 4. did the internet open?
+        state, extra = "portal", None
+        for attempt in range(VERIFY_TRIES):
+            state, extra = verify() if verify else ("portal", None)
+            if state == "open":
+                break
+            if attempt < VERIFY_TRIES - 1:
+                sleep(0.7)
+        note(f"4. connectivity check: {state}" + (f" ({extra})" if extra and state == "dead" else ""))
+        if state == "open":
+            return True, f"logged in (the portal answered HTTP {resp.status_code})"
+        if state == "dead":
+            return False, f"logged in, but there is no internet afterwards: {extra or 'connectivity check failed'}"
+        if rejected:
+            return False, "the portal rejected the login (it sent you back to the login page): check the username and password"
+        return False, f"the portal still blocks the connection after the login (HTTP {resp.status_code}{', to ' + _short(final_loc, 60) if final_loc else ''})"
+    except httpx.HTTPError as e:
+        note(f"   request failed: {type(e).__name__}: {e}")
+        return False, f"request failed: {type(e).__name__}"
+    except PortalError as e:
+        return False, str(e)
+    finally:
+        if own:
+            http.close()
 
 
 # ---------------------------------------------------------------- "Copy as cURL" import

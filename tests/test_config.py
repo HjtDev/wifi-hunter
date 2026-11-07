@@ -161,3 +161,24 @@ def tomllib_roundtrip(values):
     from dorm_ip import wizard
 
     return tomllib.loads(wizard.render_config(values)) == values
+
+
+def test_portal_flow_mode_needs_no_url(tmp_path):
+    cfg = load_config(write(tmp_path, BASE + '[portal]\nenabled = true\nmode = "flow"\n'))
+    assert cfg.portal.enabled and cfg.portal.mode == "flow" and cfg.portal.url == ""
+    assert cfg.portal.post_drop_params == ["reason"] and cfg.portal.post_path == "" and cfg.portal.form_username_field == ""
+
+
+def test_portal_mode_is_validated_and_replay_still_needs_a_url(tmp_path):
+    with pytest.raises(ConfigError, match="portal.mode"):
+        load_config(write(tmp_path, BASE + '[portal]\nmode = "magic"\n'))
+    with pytest.raises(ConfigError, match="portal.url"):
+        load_config(write(tmp_path, BASE + '[portal]\nenabled = true\nmode = "replay"\n'))
+    assert load_config(write(tmp_path, BASE)).portal.mode == "replay"  # existing configs keep working
+
+
+def test_example_config_recommends_flow():
+    from dorm_ip import wizard
+
+    p = wizard.example_values()["portal"]
+    assert p["mode"] == "flow" and p["enabled"] is False and p["post_drop_params"] == ["reason"]
