@@ -111,3 +111,74 @@ def test_watchdog_new_keys_have_defaults(tmp_path):
 def test_override_max_and_order(tmp_path):
     cfg = with_overrides(load_config(write(tmp_path, BASE)), max_candidates=7, order="sequential")
     assert cfg.hunt.max_candidates == 7 and cfg.hunt.order == "sequential"
+
+
+def test_hunt_live_and_skip_settings(tmp_path):
+    cfg = load_config(write(tmp_path, BASE))
+    assert cfg.hunt.live_change == "auto" and cfg.hunt.skip_failed_minutes == 30 and cfg.hunt.explore_near_good
+    with pytest.raises(ConfigError, match="live_change"):
+        load_config(write(tmp_path, BASE + '[hunt]\nlive_change = "yes"\n'))
+    with pytest.raises(ConfigError, match="skip_failed_minutes"):
+        load_config(write(tmp_path, BASE + "[hunt]\nskip_failed_minutes = -1\n"))
+    assert load_config(write(tmp_path, BASE + '[hunt]\nlive_change = "off"\nskip_failed_minutes = 0\n')).hunt.live_change == "off"
+
+
+def test_example_config_has_the_new_keys():
+    from dorm_ip import wizard
+
+    h = wizard.example_values()["hunt"]
+    assert h["live_change"] == "auto" and h["skip_failed_minutes"] == 30 and h["explore_near_good"] is True
+
+
+def test_phase2_settings(tmp_path):
+    cfg = load_config(write(tmp_path, BASE))
+    assert cfg.hunt.triage_batch == 12 and cfg.hunt.find == 1
+    assert cfg.standby.max_age_hours == 12 and cfg.standby.failover is True
+    with pytest.raises(ConfigError, match="triage_batch"):
+        load_config(write(tmp_path, BASE + "[hunt]\ntriage_batch = 99\n"))
+    with pytest.raises(ConfigError, match="find"):
+        load_config(write(tmp_path, BASE + "[hunt]\nfind = 0\n"))
+    off = load_config(write(tmp_path, BASE + "[hunt]\ntriage_batch = 0\nfind = 3\n[standby]\nfailover = false\n"))
+    assert off.hunt.triage_batch == 0 and off.hunt.find == 3 and off.standby.failover is False
+
+
+def test_overrides_for_find_and_triage(tmp_path):
+    cfg = with_overrides(load_config(write(tmp_path, BASE)), find=3, triage_batch=0)
+    assert cfg.hunt.find == 3 and cfg.hunt.triage_batch == 0
+
+
+def test_example_config_has_the_phase2_keys():
+    from dorm_ip import wizard
+
+    v = wizard.example_values()
+    assert v["hunt"]["triage_batch"] == 12 and v["hunt"]["find"] == 1 and v["standby"]["failover"] is True
+    assert tomllib_roundtrip(v)
+
+
+def tomllib_roundtrip(values):
+    import tomllib
+
+    from dorm_ip import wizard
+
+    return tomllib.loads(wizard.render_config(values)) == values
+
+
+def test_portal_flow_mode_needs_no_url(tmp_path):
+    cfg = load_config(write(tmp_path, BASE + '[portal]\nenabled = true\nmode = "flow"\n'))
+    assert cfg.portal.enabled and cfg.portal.mode == "flow" and cfg.portal.url == ""
+    assert cfg.portal.post_drop_params == ["reason"] and cfg.portal.post_path == "" and cfg.portal.form_username_field == ""
+
+
+def test_portal_mode_is_validated_and_replay_still_needs_a_url(tmp_path):
+    with pytest.raises(ConfigError, match="portal.mode"):
+        load_config(write(tmp_path, BASE + '[portal]\nmode = "magic"\n'))
+    with pytest.raises(ConfigError, match="portal.url"):
+        load_config(write(tmp_path, BASE + '[portal]\nenabled = true\nmode = "replay"\n'))
+    assert load_config(write(tmp_path, BASE)).portal.mode == "replay"  # existing configs keep working
+
+
+def test_example_config_recommends_flow():
+    from dorm_ip import wizard
+
+    p = wizard.example_values()["portal"]
+    assert p["mode"] == "flow" and p["enabled"] is False and p["post_drop_params"] == ["reason"]

@@ -40,8 +40,14 @@ def parse_ping(text: str) -> tuple[float | None, float | None, float | None]:
     return float(r.group(2)), loss, float(r.group(4))  # avg, loss, mdev as jitter
 
 
-def ping(target: str, count: int, wait: int = 2) -> tuple[float | None, float | None, float | None]:
-    cmd = ["ping", "-n", "-q", "-c", str(count), "-i", "0.3", "-W", str(wait), target]
+def ping(
+        target: str, count: int, wait: int = 2, source: str | None = None
+) -> tuple[float | None, float | None, float | None]:
+    """`source` sends the pings from that local address (used when several IPs are on the interface)."""
+    cmd = ["ping", "-n", "-q", "-c", str(count), "-i", "0.3", "-W", str(wait)]
+    if source:
+        cmd += ["-I", source]
+    cmd.append(target)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=count * (wait + 1) + 5)
     except FileNotFoundError:
@@ -61,8 +67,10 @@ def gateway_reachable(gateway: str) -> bool:
 
 # ---------------------------------------------------------------- http
 
-def _client(timeout: httpx.Timeout | None = None) -> httpx.Client:
+def _client(timeout: httpx.Timeout | None = None, source: str | None = None) -> httpx.Client:
+    """`source`: connect from this local address (several IPs on one interface)."""
     return httpx.Client(
+        transport=httpx.HTTPTransport(local_address=source) if source else None,
         timeout=timeout or httpx.Timeout(8.0, read=4.0),
         follow_redirects=False,
         trust_env=False,  # ignore proxy env vars so we measure the real link
@@ -80,16 +88,54 @@ def classify_portal(status: int, content_type: str, body: bytes) -> str:
     return "dead"
 
 
-def check_portal(cfg: Config) -> tuple[str, int, str | None]:
-    """-> (state, bytes_used, portal_url). state: open | portal | dead."""
+def describe_error(e: Exception) -> tuple[str, bool]:
+    """-> (what went wrong, failed_fast). A timeout is not retried; an instant DNS/connect error is."""
+    if isinstance(e, httpx.TimeoutException):
+        return "no answer within 5 s (connection timed out)", False
+    text = f"{e} {e.__cause__!r}".lower()
+    if "name or service not known" in text or "name resolution" in text or "gaierror" in text or "nodename" in text:
+        return "DNS lookup failed", True
+    if isinstance(e, httpx.ConnectError):
+        return "could not connect (network unreachable or refused)", True
+    if isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError)):
+        return "connection reset", True
+    return f"network error ({type(e).__name__})", True
+
+
+def _check_once(url: str, source: str | None) -> tuple[str, int, str | None, bool]:
     try:
-        with _client(httpx.Timeout(5.0)) as c:
-            r = c.get(cfg.tests.connectivity_url)
+        with _client(httpx.Timeout(5.0), source) as c:
+            r = c.get(url)
             body = r.content[:4096]
             state = classify_portal(r.status_code, r.headers.get("content-type", ""), body)
-            return state, len(r.content), r.headers.get("location")
-    except (httpx.HTTPError, OSError):
-        return "dead", 0, None
+            return state, len(r.content), r.headers.get("location"), False
+    except (httpx.HTTPError, OSError) as e:
+        text, fast = describe_error(e)
+        return "dead", 0, text, fast
+
+
+def check_url(
+        url: str, source: str | None = None, *, retries: int = 2, sleep: Callable[[float], None] = time.sleep
+) -> tuple[str, int, str | None]:
+    """-> (state, bytes_used, extra). state: open | portal | dead.
+
+    extra is the portal URL for `portal` and a short description of the problem for `dead`.
+    Right after an IP switch DNS or routing may still be settling, so a *fast* failure (DNS or
+    connect error) is retried up to `retries` times, 1 s apart; a timeout is not (the path is blocked).
+    """
+    for attempt in range(retries + 1):
+        state, nbytes, extra, fast = _check_once(url, source)
+        if state != "dead" or not fast or attempt == retries:
+            break
+        sleep(1.0)
+    return state, nbytes, extra
+
+
+def check_portal(
+        cfg: Config, source: str | None = None, *, retries: int = 2, sleep: Callable[[float], None] = time.sleep
+) -> tuple[str, int, str | None]:
+    """The connectivity check against `tests.connectivity_url` (see check_url)."""
+    return check_url(cfg.tests.connectivity_url, source, retries=retries, sleep=sleep)
 
 
 def quick_speed(cfg: Config, max_seconds: float = 20.0) -> tuple[float | None, int]:
@@ -117,6 +163,33 @@ def quick_speed(cfg: Config, max_seconds: float = 20.0) -> tuple[float | None, i
             return total * 8 / elapsed / 1e6, total
     except (httpx.HTTPError, OSError):
         return None, 0
+
+
+def small_download(
+        cfg: Config, nbytes: int, source: str | None = None, max_seconds: float = 12.0
+) -> tuple[bool, int, float | None]:
+    """Download ~nbytes from speed_url (its bytes= parameter is replaced). -> (complete, bytes, Mbps)."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    parts = urlsplit(cfg.tests.speed_url)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    url = cfg.tests.speed_url
+    if any(k == "bytes" for k, _ in query):
+        url = urlunsplit(parts._replace(query=urlencode([(k, str(nbytes) if k == "bytes" else v) for k, v in query])))
+    total = 0
+    t0 = time.monotonic()
+    try:
+        with _client(httpx.Timeout(6.0, read=4.0), source) as c, c.stream("GET", url) as r:
+            if r.status_code != 200:
+                return False, 0, None
+            for chunk in r.iter_bytes(32768):
+                total += len(chunk)
+                if total >= nbytes or time.monotonic() - t0 > max_seconds:
+                    break
+    except (httpx.HTTPError, OSError):
+        return False, total, None
+    elapsed = max(time.monotonic() - t0, 1e-6)
+    return total >= nbytes * 0.9, total, total * 8 / elapsed / 1e6
 
 
 # ---------------------------------------------------------------- dns
@@ -243,6 +316,7 @@ def run_all(
         profile: NetProfile | None = None,
         progress: Progress | None = None,
         on_portal: Callable[[], bool] | None = None,
+        gateway_ok: bool | None = None,
 ) -> TestResult:
     """Run the suite in order and stop at the first failure. bytes_used counts HTTP
     payload only (ping/DNS traffic is negligible)."""
@@ -269,20 +343,24 @@ def run_all(
         return scorer.failure(r, cfg, final=False)[0] is not None
 
     say("Gateway reachable?")
-    r.gateway_ok = gateway_reachable(cfg.network.gateway)
+    # the hunter already polled the gateway while waiting for the link: don't ping it again
+    r.gateway_ok = gateway_ok if gateway_ok is not None else gateway_reachable(cfg.network.gateway)
     if not r.gateway_ok:
         return finish()
 
     say("Portal / connectivity check")
-    r.portal_state, nbytes, _loc = check_portal(cfg)
+    r.portal_state, nbytes, detail = check_portal(cfg)
     r.bytes_used += nbytes
     if r.portal_state == "portal" and on_portal is not None:
         say("Portal: logging in")
         if on_portal():
-            r.portal_state, nbytes, _loc = check_portal(cfg)
+            r.portal_state, nbytes, detail = check_portal(cfg)
             r.bytes_used += nbytes
     if failed():
-        return finish()
+        res = finish()
+        if r.portal_state == "dead" and detail:
+            res.fail_reason = f"no internet: {detail}"  # say *why*, e.g. DNS failed vs timed out
+        return res
 
     say("Ping")
     r.ping_avg_ms, r.ping_loss_pct, r.ping_jitter_ms = ping(cfg.tests.ping_target, cfg.tests.ping_count)

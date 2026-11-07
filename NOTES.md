@@ -133,3 +133,82 @@ Decisions made where the spec was ambiguous (simplest option chosen).
   as 1 MB/s = 8 Mbps for both quick and sustained; `order = "best-history"`; `final_mode = "override"`;
   watchdog `interval_seconds = 30`.
 - `data_budget_mb = 0` means unlimited.
+
+## Roadmap phase 1 (live switching, readiness polling, smart ordering)
+- `applier.switch_static(live=True)`: `nmcli device modify <dev> ipv4.*` (runtime only, saved profile untouched), then
+  `nmcli dev show` must list exactly the new address; otherwise (nmcli error, address unchanged, or an extra address next to
+  the old one) it falls back to `con mod` + `con up` and returns a note. The hunter turns live switching off for the rest of
+  the run after the first fallback. The winner is written to the profile with `persist_static` (`con mod`, no reconnect).
+  Restore after a failed/interrupted hunt is still `con mod` (saved values) + `con up`.
+- This cannot be tested without real NetworkManager/wifi, hence the read-back check and `dorm-ip live-check`
+  (switches to a known-good IP live, optionally by reconnect too, always restores the original profile).
+- `_wait_ready` polls the gateway (1 ping, 0.2 s apart) instead of sleeping `settle_seconds`; live: max `settle_seconds`,
+  reconnect: max `max(2 x settle_seconds, 8 s)`. `run_all(gateway_ok=...)` reuses that result instead of pinging again, and a
+  gateway that never answered is recorded without running any test. The old "retry once if the gateway is unreachable" is gone
+  (the longer reconnect wait replaces it).
+- New tables `scan_runs`/`scan_hits` (only non-empty scans are stored). `Ranking(scores, skip, busy)` comes from
+  `DB.ranking()`. Cooldown: base x 2^(streak-1), max 12 h, base only if the IP passed in the last 24 h; "captive portal"
+  failures are ignored. Skipped IPs are appended after all others (shortest cooldown first), so they are only reached when
+  `max_candidates` is larger than the number of other candidates.
+- Scoring for `best-history`: score (last 5 results, failures = 0, +-2 h of the current hour double) - 20 x busy ratio
+  + 10 for an untested IP within 3 addresses of an IP scoring >= 60. Random and sequential order only get the skip rule.
+- `hunt` prints the time per candidate and the total.
+
+## Roadmap phase 2 (parallel triage, --find, standby)
+- Triage: `applier.switch_many` puts the control IP (the IP the hunt started from) plus a batch of candidates on the running
+  connection with one `nmcli device modify ipv4.addresses a/21,b/21,...` (first = primary) and checks the whole set read back.
+  There is no reconnect fallback (several addresses only exist live): "unsupported" disables triage for the rest of the hunt and
+  the batch goes back to the queue. Each probe is sent from its own address (`ping -I`, httpx `local_address`, portal login
+  bound to the source address).
+- Triage checks: gateway (2 pings), portal state (+ auto-login hook, `login_during_hunt`), loss (4 pings to ping_target,
+  limit 25%), ping (limit 2 x max_ping_ms), small download (300 KB must complete, >= 0.3 Mbps). It never accepts or ranks.
+  Survivors go through the unchanged full test one at a time (the first switch drops the extra addresses).
+- Safety nets for "multi-IP does not work here": control IP fails the gateway check, or (no control) >= 4 candidates and all
+  of them "gateway unreachable". Both disable triage and requeue the batch. Failed triage results are saved as TestResults
+  (reason = the triage reason, so "captive portal" stays neutral for the cooldown).
+- `--find N`: collect N passing IPs (default `hunt.find` = 1); best = highest score; if the best is not the active IP the hunt
+  switches back to it (live, `settle_portal`), then persists and finalizes. Others -> `standby` table (upsert by IP).
+- Standby: `standby(ip, ts, score, mac, dns_mode)`, expired after `standby.max_age_hours`. `hunter.failover()` tries up to 3
+  entries with a quick re-check (`run_all(deep=False)`), drops failures, persists the winner. The watchdog calls it after the
+  false-alarm check and budget check and before a hunt; never during a VPN.
+- Connectivity check: fast DNS/connect failures are retried twice (1 s apart) because right after a live switch the resolver
+  or routes may still be settling; timeouts are not retried. For "dead" the third tuple element is the cause, which becomes
+  `no internet: <cause>` in the result.
+
+## Roadmap phase 3 (shell command, hunt --watch, CI, README, 0.9.0)
+- `shellint.py`: a marker-delimited block (`# >>> dorm-ip >>>` ... `# <<< dorm-ip <<<`) with a *function* (not a plain alias, so it
+  also works with arguments and quoting) `uv run --quiet --project <repo> dorm-ip "$@"`. bash -> `~/.bashrc`, zsh ->
+  `$ZDOTDIR/.zshrc` or `~/.zshrc`, fish -> `conf.d/dorm-ip.fish` (the whole file is ours; fish function with `$argv`).
+  Shells offered: binary on PATH and (login shell, or its rc file / fish config dir exists). Install is idempotent (replaces the
+  block in place), backs the file up once as `<file>.dorm-ip.bak`, uninstall removes only the block (deletes the fish file).
+  The path is quoted with `shlex.quote` / a fish quoter; a test runs the real bash function with a stub `uv`.
+  `init --yes` and `--no-shell` never touch dotfiles; the step is a question per shell. When the package is not run from a
+  checkout (no `pyproject.toml` next to it) nothing is added: it is already a normal command.
+- `hunt --watch` reuses the same `_watch_loop` as `watch` (DB opened by the loop; only after a successful, non-dry-run hunt).
+  The watchdog's re-hunt now also passes `on_standby`, so `hunt.find > 1` keeps the extra IPs during automatic re-hunts.
+- CI: `.github/workflows/ci.yml` (pull requests and pushes to `main`): `uv sync`, `uv run pytest -q` on 3.12/3.13/3.14, CLI smoke
+  checks, and a wheel build that must contain `config.example.toml`. It uses `uv sync` (not `--locked`), so a stale `uv.lock`
+  after the version bump does not fail CI; run `uv lock` and commit it.
+- `tests/test_readme.py` fails if a command, option or config key is missing from the README, if the version differs between
+  `pyproject.toml`, `dorm_ip/__init__.py` and the README/CHANGELOG, or if the CI workflow / Makefile docs go missing.
+- Version 0.9.0; `dorm-ip --version` added.
+
+## 0.9.1: portal flow login
+- Diagnosis from a real Kerio Control HAR: the login URL carries `dest` (base64 of the page asked for) and `host` (base64 of
+  "<client ip> <32 hex>": a per-client token), the login page sets `SESSION_CONTROL_WEBIFACE` / `TOKEN_CONTROL_WEBIFACE`, the POST
+  body is only `kerio_username` + `kerio_password`, and the answer is `302` to `dest` (also a `302` back to `/login/?reason=failure`
+  on a rejected login, and the user saw a failure message although the internet was open). The POST URL is the login-page URL with
+  the path swapped to `/internal/dologin.php` and `reason` dropped. The old replay import froze `host`, dropped the cookies and
+  judged success by HTTP code, so it broke on any IP but the captured one.
+- Flow: (1) GET `connectivity_url` without following redirects -> Location is the *fresh* login URL (an already-204 answer means
+  "already open"; an HTML page with a form is used directly); (2) GET it with a cookie jar, parse `<form>`s (stdlib HTMLParser,
+  entities decoded) and pick the one with a password input, else fall back to `post_path` / the known-portal table (Kerio is
+  recognised by its `Server` header or by a `/login...` URL with `NTLM` and `dest` parameters); (3) POST the filled form with
+  Referer/Origin, follow redirects only while they stay on the portal host; (4) poll the connectivity check up to 4 times
+  (0.7 s apart): success = "open". A redirect back with `reason=failure` only changes the failure message.
+- The derived POST URL keeps the raw query string (base64 contains `+`, `/`, `=`: decoding and re-encoding would damage it).
+- Name resolution in flow mode: the portal host, `*.local`/`*.lan`/... and single-label names -> dorm DNS directly (UDP); other
+  hosts -> the system DNS, falling back to the dorm DNS if it fails; `portal.host_ip` pins the portal host.
+- `tests.check_url(url, source)` is the connectivity check for any URL (`check_portal(cfg)` uses `tests.connectivity_url`).
+- Trace lines never contain credentials (tests assert it); cookies are listed by name only.
+- Not done yet from the roadmap's 1.3: HAR import, learning/refreshing the session lifetime.

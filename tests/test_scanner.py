@@ -109,3 +109,55 @@ def test_best_history_orders_by_score_unknown_neutral(cfg):
 def test_best_history_without_scores_is_random(cfg):
     order = scanner.candidates(cfg, set(), order="best-history", rng=random.Random(3))
     assert set(order) == set(cfg.ips)
+
+
+# ---- smart ordering (phase 1)
+def with_order(cfg, order="best-history", **kw):
+    from dataclasses import replace
+
+    return replace(cfg, hunt=replace(cfg.hunt, order=order, **kw))
+
+
+def test_skipped_ips_go_last_shortest_cooldown_first(cfg):
+    skip = {"172.18.40.3": 30.0, "172.18.40.4": 5.0}
+    order = scanner.candidates(cfg, set(), order="sequential", skip=skip)
+    assert order[-2:] == ["172.18.40.4", "172.18.40.3"] and len(order) == 20
+    assert not set(order[:-2]) & set(skip)
+
+
+def test_skip_works_with_every_order(cfg):
+    for o in ("random", "sequential", "best-history"):
+        order = scanner.candidates(cfg, set(), order=o, skip={"172.18.40.1": 9.0}, rng=random.Random(1))
+        assert order[-1] == "172.18.40.1"
+
+
+def test_busy_ips_rank_lower_in_best_history(cfg):
+    busy = {"172.18.40.9": 1.0, "172.18.40.8": 0.5}
+    order = scanner.candidates(with_order(cfg), set(), busy=busy, rng=random.Random(2))
+    assert order[-1] == "172.18.40.9" and order[-2] == "172.18.40.8"
+
+
+def test_busy_is_ignored_for_random_order(cfg):
+    a = scanner.candidates(with_order(cfg, "random"), set(), busy={"172.18.40.9": 1.0}, rng=random.Random(5))
+    b = scanner.candidates(with_order(cfg, "random"), set(), rng=random.Random(5))
+    assert a == b
+
+
+def test_untested_neighbors_of_good_ips_come_first(cfg):
+    scores = {"172.18.40.10": 90.0}
+    order = scanner.candidates(with_order(cfg), set(), scores=scores, rng=random.Random(3))
+    assert order[0] == "172.18.40.10"  # the known-good IP itself
+    near = set(order[1:7])
+    assert {"172.18.40.7", "172.18.40.8", "172.18.40.9", "172.18.40.11", "172.18.40.12", "172.18.40.13"} == near
+
+
+def test_near_good_bonus_can_be_disabled(cfg):
+    scores = {"172.18.40.10": 90.0}
+    order = scanner.candidates(with_order(cfg, explore_near_good=False), set(), scores=scores, rng=random.Random(3))
+    assert order[0] == "172.18.40.10" and set(order[1:7]) != {"172.18.40.7", "172.18.40.8", "172.18.40.9", "172.18.40.11", "172.18.40.12", "172.18.40.13"}
+
+
+def test_known_bad_ips_rank_below_untested(cfg):
+    scores = {"172.18.40.5": 0.0}
+    order = scanner.candidates(with_order(cfg), set(), scores=scores, rng=random.Random(4))
+    assert order[-1] == "172.18.40.5"

@@ -5,13 +5,15 @@ from __future__ import annotations
 import random
 import signal
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from . import applier, netinfo, portal, scanner
+from . import applier, netinfo, portal, scanner, triage
 from . import tests as nettests
 from .config import Config
+from .db import Ranking
 from .models import NetProfile, TestResult
 from .netinfo import NetError
 
@@ -25,6 +27,7 @@ class HuntObserver:
 
     def note(self, text: str) -> None: ...
     def scanned(self, used: set[str], candidates: list[str]) -> None: ...
+    def triage_started(self, ips: list[str]) -> None: ...
     def trying(self, ip: str, index: int, total: int) -> None: ...
     def stage(self, ip: str, text: str) -> None: ...
     def skipped(self, ip: str, why: str) -> None: ...
@@ -59,7 +62,11 @@ def _sigterm_as_interrupt() -> Iterator[None]:
 
 def _login(cfg: Config, ip: str = "", mac: str = "") -> tuple[bool, str]:
     """Portal login with the portal host resolved through the dorm DNS (works under override DNS)."""
-    return portal.login_detail(cfg.portal, ip=ip, mac=mac, dorm_dns=cfg.dns.default)
+    # sent from `ip` itself: with several addresses on the interface the login must come from the right one
+    return portal.login_detail(
+        cfg.portal, ip=ip, mac=mac, dorm_dns=cfg.dns.default, source_ip=ip or None,
+        connectivity_url=cfg.tests.connectivity_url,
+    )
 
 
 def try_login(cfg: Config, ip: str = "", mac: str = "") -> bool:
@@ -81,11 +88,14 @@ def settle_portal(
         mac: str,
         *,
         login: bool = True,
+        live: bool = False,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
         attempts: int = 4,
 ) -> PortalStatus:
     """After changing the IP: wait for the link, check the portal and log in if needed."""
-    sleep(cfg.hunt.settle_seconds)
+    wait = cfg.hunt.settle_seconds if live else max(cfg.hunt.settle_seconds * 2, 8.0)
+    _wait_ready(cfg, wait, sleep, clock)
     state, _b, url = nettests.check_portal(cfg)
     for _ in range(attempts - 1):
         if state != "dead":
@@ -168,6 +178,20 @@ def _scan(cfg: Config, target: applier.Target, obs: HuntObserver, dry_run: bool)
     return used
 
 
+def _wait_ready(
+        cfg: Config, timeout: float, sleep: Callable[[float], None], clock: Callable[[], float]
+) -> bool:
+    """Poll the gateway until it answers (or `timeout` passes) instead of sleeping a fixed time."""
+    deadline = clock() + timeout
+    while True:
+        _avg, loss, _jit = nettests.ping(cfg.network.gateway, 1, wait=1)
+        if loss is not None and loss < 100:
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(0.2)
+
+
 def hunt(
         cfg: Config,
         *,
@@ -175,35 +199,63 @@ def hunt(
         dry_run: bool = False,
         spent: Callable[[], int] | None = None,
         save: Callable[[TestResult], None] | None = None,
-        history: dict[str, float] | None = None,
+        ranking: Ranking | None = None,
+        on_scan: Callable[[set[str]], None] | None = None,
+        on_standby: Callable[[list[TestResult]], None] | None = None,
+        find: int | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
         rng: random.Random | None = None,
 ) -> TestResult | None:
-    """Try candidates until one passes. Returns the passing result, or None.
+    """Try candidates until `find` of them pass the full test (default 1). Returns the best, or None.
 
-    The original profile is restored when nothing passes, on any error, on Ctrl+C and on SIGTERM.
-    `spent()` returns bytes already used today (phase 4 passes the database total);
-    by default only this run's traffic is counted. `save` is called with every result.
+    With live switching available, candidates are first filtered in parallel (triage, several IPs on
+    the interface at once) and only the survivors get the full serial test. The best passing IP is kept;
+    the other passing ones go to `on_standby`. The original profile is restored when nothing passes,
+    on any error, on Ctrl+C and on SIGTERM. `spent()` returns bytes already used today; `save` gets
+    every result, `on_scan` every non-empty ARP scan, `ranking` decides the order.
     """
     obs = observer or HuntObserver()
+    want = find if find is not None else cfg.hunt.find
     results: list[TestResult] = []
+    winners: list[TestResult] = []
     spent_bytes = spent or (lambda: sum(r.bytes_used for r in results))
     budget = cfg.tests.budget_bytes()
     use_override = cfg.dns.hunt_with_override
     dns = cfg.dns.override if use_override else cfg.dns.default
     dns_mode = "override" if use_override else "default"
     n = cfg.network
+    rk = ranking or Ranking()
 
     target = applier.begin_change(n.interface, n.connection, dry_run=dry_run, notify=obs.note)
     done = False
-    winner: TestResult | None = None
+    live_on = cfg.hunt.live_change == "auto" and bool(target.device)
+    triage_on = live_on and cfg.hunt.triage_batch >= 2 and not dry_run
+    last_mode: str | None = None
+    active_ip: str | None = None
+    used: set[str] = set()
+    control_ip: str | None = None
+    if triage_on:
+        try:  # the IP we start from works: it proves that sending from a secondary address works too
+            control_ip = netinfo.get_profile(n.interface, target.connection).ip
+        except NetError:
+            control_ip = None
     try:
         with _sigterm_as_interrupt():
             used = _scan(cfg, target, obs, dry_run)
-            order = scanner.candidates(cfg, used, scores=history, rng=rng)
+            if on_scan and used and not dry_run:
+                on_scan(used)
+            order = scanner.candidates(cfg, used, scores=rk.scores, skip=rk.skip, busy=rk.busy, rng=rng)
             todo = order[: cfg.hunt.max_candidates]
             if dry_run:
                 todo = todo[:DRY_RUN_CANDIDATES]
+            position = {ip: i for i, ip in enumerate(todo, 1)}
+            retried = sum(1 for ip in todo if ip in rk.skip)
+            cooling = sum(1 for ip in order if ip in rk.skip) - retried
+            if cooling > 0:
+                obs.note(f"Skipping {cooling} recently failed IPs (use --retry-failed to try them anyway)")
+            if retried:
+                obs.note(f"Not enough other candidates: retrying {retried} recently failed IPs")
             obs.scanned(used, todo)
 
             apply_failures = 0
@@ -225,64 +277,190 @@ def hunt(
                 obs.note(f"Auto-login failed ({detail}){suffix}")
                 return False
 
-            for i, ip in enumerate(todo, 1):
-                if not dry_run and spent_bytes() >= budget:
-                    obs.note("Daily data budget reached; stopping")
-                    break
-                obs.trying(ip, i, len(todo))
+            def mac_now() -> str:
+                return netinfo.read_mac(target.device) if target.device else ""
+
+            def record(r: TestResult) -> None:
+                results.append(r)
+                if save:
+                    save(r)
+                obs.result(r)
+
+            def test_one(ip: str) -> TestResult | None:
+                """Switch to `ip` alone and run the full test. None if the switch itself failed."""
+                nonlocal apply_failures, live_on, last_mode, active_ip
+                obs.trying(ip, position[ip], len(todo))
                 try:
-                    applier.apply_static(
-                        ip, n.prefix, n.gateway, dns, connection=target.connection, dry_run=dry_run
+                    sw = applier.switch_static(
+                        ip, n.prefix, n.gateway, dns, target=target, live=live_on,
+                        dry_run=dry_run, sleep=sleep, clock=clock,
                     )
                 except NetError as e:
                     apply_failures += 1
                     obs.skipped(ip, str(e))
                     if apply_failures >= MAX_CONSECUTIVE_APPLY_FAILURES:
                         raise NetError(f"{apply_failures} consecutive failures applying an IP; last: {e}") from None
-                    continue
+                    return None
                 apply_failures = 0
+                if live_on and sw.mode != "live":
+                    live_on = False
+                    obs.note(sw.note)
+                elif live_on and last_mode is None and not dry_run:
+                    obs.note("Live IP switching works: no reconnect between candidates")
+                last_mode = sw.mode
+                active_ip = ip
                 if dry_run:
-                    continue
-
+                    return None
                 profile = NetProfile(
                     interface=target.device, connection=target.connection, method="manual",
-                    ip=ip, prefix=n.prefix, gateway=n.gateway, dns=list(dns),
-                    mac=netinfo.read_mac(target.device) if target.device else "",
+                    ip=ip, prefix=n.prefix, gateway=n.gateway, dns=list(dns), mac=mac_now(),
                 )
+                # a live switch is ready in well under a second; a reconnect needs the wifi to come back
+                wait = cfg.hunt.settle_seconds if sw.mode == "live" else max(cfg.hunt.settle_seconds * 2, 8.0)
+                obs.stage(ip, "waiting for the gateway")
+                ready = _wait_ready(cfg, wait, sleep, clock)
+                login_hook = None
+                if cfg.portal.enabled and cfg.portal.login_during_hunt:
+                    login_hook = lambda: login_for(ip, profile.mac)  # noqa: E731
+                r = nettests.run_all(
+                    cfg, ip, dns_mode, deep=True, seen_in_use=ip in used, profile=profile,
+                    progress=lambda m: obs.stage(ip, m), on_portal=login_hook, gateway_ok=ready,
+                )
+                record(r)
+                return r
 
-                def run_tests(ip: str = ip, profile: NetProfile = profile) -> TestResult:
-                    login_hook = None
-                    if cfg.portal.enabled and cfg.portal.login_during_hunt:
-                        login_hook = lambda: login_for(ip, profile.mac)  # noqa: E731
-                    return nettests.run_all(
-                        cfg, ip, dns_mode, deep=True, seen_in_use=ip in used, profile=profile,
-                        progress=lambda m: obs.stage(ip, m), on_portal=login_hook,
-                    )
+            def triage_batch(batch: list[str]) -> list[str] | None:
+                """Filter `batch` in parallel. -> survivors, or None if triage does not work here
+                (the batch is then put back and tested one by one)."""
+                nonlocal triage_on
+                control = control_ip if control_ip and control_ip not in batch else None
+                addresses = ([control] if control else []) + batch
+                sw = applier.switch_many(addresses, n.prefix, n.gateway, dns, target=target, sleep=sleep, clock=clock)
 
-                sleep(cfg.hunt.settle_seconds)
-                r = run_tests()
-                if r.fail_reason == "gateway unreachable":
-                    # Wifi may still be re-associating after `con up`: give it one more settle period.
-                    obs.stage(ip, "gateway not reachable yet, retrying")
-                    sleep(cfg.hunt.settle_seconds)
-                    r = run_tests()
+                def give_up(why: str) -> None:
+                    nonlocal triage_on
+                    triage_on = False
+                    queue.extendleft(reversed(batch))
+                    obs.note(f"Parallel triage does not work here ({why}); testing one by one")
 
-                results.append(r)
-                if save:
-                    save(r)
-                obs.result(r)
-                if r.passed:
-                    winner = r
-                    break
-                if spent_bytes() > budget:
+                if sw.mode != "live":
+                    give_up(sw.note)
+                    return None
+                obs.triage_started(batch)
+                sleep(0.5)  # let ARP learn the new addresses
+                login = (lambda ip: login_for(ip, mac_now())) if cfg.portal.enabled and cfg.portal.login_during_hunt else None
+                trs, ctrl = triage.run_triage(cfg, batch, control=control, login=login)
+                if ctrl is not None and not ctrl.passed:
+                    give_up("your own IP stopped answering when it was sent from a secondary address")
+                    return None
+                if ctrl is None and len(batch) >= 4 and all(t.reason == "gateway unreachable" for t in trs.values()):
+                    give_up("not one of the extra addresses reached the gateway")
+                    return None
+                survivors = []
+                for ip in batch:
+                    if trs[ip].passed:
+                        survivors.append(ip)
+                    else:
+                        record(triage.to_result(cfg, trs[ip], mac=mac_now(), dns_mode=dns_mode, seen_in_use=ip in used))
+                return survivors
+
+            queue: deque[str] = deque(todo)
+            over_budget = False
+            while queue and len(winners) < want and not over_budget:
+                if not dry_run and spent_bytes() >= budget:
                     obs.note("Daily data budget reached; stopping")
                     break
+                if triage_on and len(queue) >= 2:
+                    batch = [queue.popleft() for _ in range(min(cfg.hunt.triage_batch, len(queue)))]
+                    survivors = triage_batch(batch)
+                    if survivors is None:
+                        continue
+                    candidates_now = survivors
+                else:
+                    candidates_now = [queue.popleft()]
+                for ip in candidates_now:
+                    r = test_one(ip)
+                    if r is None:
+                        continue
+                    if r.passed:
+                        winners.append(r)
+                        if len(winners) >= want:
+                            break
+                    if spent_bytes() > budget:
+                        obs.note("Daily data budget reached; stopping")
+                        over_budget = True
+                        break
 
-            if winner:
-                obs.stage(winner.ip, "finalizing DNS / portal")
-                obs.finalized(finalize(cfg, winner, target, sleep=sleep))
-            done = winner is not None or dry_run
+            if winners:
+                best = max(winners, key=lambda w: (w.score, w.ts))
+                if want > 1:
+                    obs.note(f"{len(winners)} of {want} requested IPs passed; keeping the best ({best.ip}, score {best.score:.0f})")
+                others = [w for w in winners if w is not best]
+                if on_standby and others:
+                    on_standby(others)
+                if active_ip != best.ip:  # a better IP was found earlier: go back to it
+                    obs.stage(best.ip, "switching back to the best IP")
+                    sw = applier.switch_static(
+                        best.ip, n.prefix, n.gateway, dns, target=target, live=live_on, sleep=sleep, clock=clock
+                    )
+                    last_mode = sw.mode
+                    st = settle_portal(cfg, best.ip, mac_now(), live=sw.mode == "live", sleep=sleep, clock=clock)
+                    if st.state != "open":
+                        obs.note(f"{best.ip} shows the portal again ({st.detail or 'login needed'})")
+                if last_mode == "live":  # only the final IP is written to the saved profile
+                    applier.persist_static(best.ip, n.prefix, n.gateway, dns, connection=target.connection)
+                obs.stage(best.ip, "finalizing DNS / portal")
+                obs.finalized(finalize(cfg, best, target, sleep=sleep))
+                done = True
+                return best
+            done = dry_run
     finally:
         if not done:
             _restore(obs)
-    return winner
+    return None
+
+
+def failover(
+        cfg: Config,
+        ips: list[str],
+        *,
+        save: Callable[[TestResult], None] | None = None,
+        drop: Callable[[str], None] | None = None,
+        observer: HuntObserver | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+        max_tries: int = 3,
+) -> TestResult | None:
+    """Switch to the first standby IP that still passes a quick re-check (instead of a full hunt).
+
+    Standby IPs already passed the full test earlier; this re-verifies them (gateway, portal, ping,
+    DNS, quick speed). A failing one is dropped from the standby list."""
+    obs = observer or HuntObserver()
+    n = cfg.network
+    dns = cfg.dns.override if cfg.dns.hunt_with_override else cfg.dns.default
+    dns_mode = "override" if cfg.dns.hunt_with_override else "default"
+    target = applier.begin_change(n.interface, n.connection, notify=obs.note)
+    live = cfg.hunt.live_change == "auto" and bool(target.device)
+    for ip in ips[:max_tries]:
+        obs.note(f"Trying standby IP {ip}")
+        sw = applier.switch_static(ip, n.prefix, n.gateway, dns, target=target, live=live, sleep=sleep, clock=clock)
+        mac = netinfo.read_mac(target.device) if target.device else ""
+        profile = NetProfile(
+            interface=target.device, connection=target.connection, method="manual", ip=ip,
+            prefix=n.prefix, gateway=n.gateway, dns=list(dns), mac=mac,
+        )
+        wait = cfg.hunt.settle_seconds if sw.mode == "live" else max(cfg.hunt.settle_seconds * 2, 8.0)
+        ready = _wait_ready(cfg, wait, sleep, clock)
+        hook = (lambda ip=ip: try_login(cfg, ip, mac)) if cfg.portal.enabled else None
+        r = nettests.run_all(cfg, ip, dns_mode, deep=False, profile=profile, gateway_ok=ready, on_portal=hook)
+        if save:
+            save(r)
+        if r.passed:
+            if sw.mode == "live":
+                applier.persist_static(ip, n.prefix, n.gateway, dns, connection=target.connection)
+            finalize(cfg, r, target, sleep=sleep)
+            return r
+        obs.note(f"Standby IP {ip} failed: {r.fail_reason}")
+        if drop:
+            drop(ip)
+    return None

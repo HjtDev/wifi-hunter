@@ -110,7 +110,8 @@ def test_invalid_answer_is_asked_again(home):
 
 
 def test_portal_setup_from_curl_without_secrets_in_config(home):
-    p = Scripted(secret="PASS5678", answers={"Portal username": "USER1234", "successful login": "Welcome"}, paste=CURL)
+    p = Scripted(secret="PASS5678", answers={"Portal username": "USER1234", "successful login": "Welcome",
+                                             "How should I log in": "replay"}, paste=CURL)
     res, target, creds = run(home, p)
     text = target.read_text()
     assert "USER1234" not in text and "PASS5678" not in text and "PHPSESSID" not in text
@@ -132,7 +133,7 @@ def test_curl_file_option_skips_pasting(home):
 
 
 def test_missing_login_request_keeps_portal_off_but_saves_credentials(home):
-    res, target, creds = run(home, Scripted(secret="pw", answers={"Portal username": "u"}, paste=""))
+    res, target, creds = run(home, Scripted(secret="pw", answers={"Portal username": "u", "How should I log in": "replay"}, paste=""))
     assert not res.portal_enabled and not load_config(target).portal.enabled
     assert creds.exists() and any("No login request" in n for n in res.notes)
 
@@ -143,7 +144,7 @@ def test_missing_password_keeps_portal_off(home):
 
 
 def test_bad_curl_is_reported_not_fatal(home):
-    p = Scripted(secret="pw", answers={"Portal username": "u"}, paste="this is not curl")
+    p = Scripted(secret="pw", answers={"Portal username": "u", "How should I log in": "replay"}, paste="this is not curl")
     res, target, _ = run(home, p)
     assert not res.portal_enabled and any("cURL" in s for s in p.said)
 
@@ -268,6 +269,7 @@ def test_init_end_to_end_through_the_real_prompts(tmp_path, monkeypatch):
         "",              # log in automatically? (Enter = yes)
         "USER1234",      # username
         "PASS5678",      # password (hidden)
+        "replay",        # how to log in (flow is the default)
         *CURL.splitlines(),
         "",              # end of the pasted request
         "Welcome",       # success text
@@ -275,7 +277,8 @@ def test_init_end_to_end_through_the_real_prompts(tmp_path, monkeypatch):
         "",              # watchdog interval
         "",              # notifications
     ]) + "\n"
-    r = CliRunner().invoke(cli.app, ["init"], input=answers)
+    # --no-shell: this test is about the prompts above; the shell question has its own tests (test_shellint.py)
+    r = CliRunner().invoke(cli.app, ["init", "--no-shell"], input=answers)
     assert r.exit_code == 0, r.output + str(r.exception)
     target = tmp_path / "cfg" / "dorm-ip" / "config.toml"
     cfg = load_config(target)
@@ -284,3 +287,40 @@ def test_init_end_to_end_through_the_real_prompts(tmp_path, monkeypatch):
     creds = tmp_path / ".config" / "dorm-ip" / "credentials.toml"
     assert stat.S_IMODE(os.stat(creds).st_mode) == 0o600
     assert tomllib.loads(creds.read_text()) == {"username": "USER1234", "password": "PASS5678"}
+
+
+# ---- flow mode in the wizard (the default: nothing to paste)
+def test_flow_is_the_default_and_needs_no_login_request(home):
+    p = Scripted(secret="PASS5678", answers={"Portal username": "USER1234"}, paste="SHOULD NOT BE ASKED")
+    res, target, creds = run(home, p)
+    cfg = load_config(target)
+    assert res.portal_enabled and cfg.portal.enabled and cfg.portal.mode == "flow" and cfg.portal.url == ""
+    assert cfg.portal.login_during_hunt is True
+    assert not any("Copy as cURL" in s for s in p.said) and any("Nothing to paste" in s for s in p.said)
+    assert tomllib.loads(creds.read_text()) == {"username": "USER1234", "password": "PASS5678"}
+    assert "PASS5678" not in target.read_text()
+
+
+def test_existing_pasted_request_keeps_replay_as_the_default(home):
+    first = Scripted(secret="PASS5678", answers={"Portal username": "USER1234", "How should I log in": "replay"}, paste=CURL)
+    run(home, first)
+    target = home / "cfg" / "dorm-ip" / "config.toml"
+    text = target.read_text().replace('mode = "replay"  # flow', 'MODE_REMOVED  # flow')
+    target.write_text("\n".join(l for l in text.splitlines() if not l.startswith("MODE_REMOVED")) + "\n")  # an old config
+    assert "mode =" not in target.read_text().split("[portal]")[1].split("enabled")[1].split("url")[0]
+    asked = []
+
+    class Spy(Scripted):
+        def choose(self, text, choices, default):
+            if "How should I log in" in text:
+                asked.append(default)
+            return super().choose(text, choices, default)
+
+    res, _, _ = run(home, Spy(secret="", answers={"Portal username": "USER1234"}))
+    assert asked == ["replay"] and res.portal_enabled
+
+
+def test_curl_file_forces_replay_without_asking(home):
+    p = Scripted(secret="PASS5678", answers={"Portal username": "USER1234"})
+    res, target, _ = run(home, p, curl_text=CURL)
+    assert load_config(target).portal.mode == "replay" and not any("How should I log in" in q for q in p.asked)

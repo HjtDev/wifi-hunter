@@ -38,7 +38,16 @@ speed_rule          = "either"        # either: quick OR sustained is enough | b
 [hunt]
 max_candidates = 30
 order          = "best-history"       # random | sequential | best-history
-settle_seconds = 4                    # wait after applying an IP
+settle_seconds = 4                    # max wait for the gateway after a live IP switch (a reconnect waits longer)
+live_change    = "auto"               # auto: switch IPs without reconnecting (verified, falls back) | off
+skip_failed_minutes = 30              # don't retry a failed IP for this long (doubles per failure, 0 = off)
+explore_near_good   = true            # best-history: try untested IPs next to known-good ones sooner
+triage_batch        = 12              # filter this many candidates in parallel first (0 = one by one)
+find                = 1               # IPs that must pass the full test; the best is kept, the rest are standby
+
+[standby]
+max_age_hours = 12                    # forget standby IPs older than this
+failover      = true                  # the watchdog tries standby IPs before running a full hunt
 
 [watchdog]
 interval_seconds        = 30
@@ -50,7 +59,8 @@ rehunt_cooldown_seconds = 300         # doubles after each failed re-hunt, max 3
 busy_mbps               = 2.0         # slow probe + your own traffic above this = ignored (0 = off)
 
 [portal]
-enabled              = false          # `dorm-ip init` turns this on once it has your login request
+enabled              = false          # `dorm-ip init` turns this on once it has your credentials
+mode                 = "flow"         # flow: follow the portal's own login page | replay: send the request below
 url                  = ""
 method               = "POST"
 content_type         = "form"         # form | json
@@ -64,6 +74,10 @@ keyring_service      = ""
 login_during_hunt    = true           # log in on candidates that show the portal
 max_logins_per_hunt  = 10
 resolve_via_dorm_dns = true           # resolve the portal host through dns.default, even on override DNS
-host_ip              = ""
+host_ip              = ""             # fixed portal IP, if its name does not resolve
+form_username_field  = ""             # flow mode: only if the login page has no parsable form
+form_password_field  = ""
+post_path            = ""
+post_drop_params     = ["reason"]
 verify_tls           = true
 timeout              = 10

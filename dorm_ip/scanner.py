@@ -59,33 +59,60 @@ def _ip_key(ip: str) -> int:
     return int(ipaddress.IPv4Address(ip))
 
 
+NEAR_RADIUS = 3  # "next to a known-good IP" = within 3 addresses
+NEAR_BONUS = 10.0  # score points for an untested IP near a good one
+GOOD_SCORE = 60.0
+BUSY_PENALTY = 20.0  # score points lost by an IP that is always in use
+
+
 def candidates(
-    cfg: Config,
-    used: set[str],
-    *,
-    order: str | None = None,
-    scores: dict[str, float] | None = None,
-    rng: random.Random | None = None,
+        cfg: Config,
+        used: set[str],
+        *,
+        order: str | None = None,
+        scores: dict[str, float] | None = None,
+        skip: dict[str, float] | None = None,
+        busy: dict[str, float] | None = None,
+        rng: random.Random | None = None,
 ) -> list[str]:
     """All candidate IPs in the order to try them.
 
-    prefer_unused: IPs not seen in the scan come first (used ones are kept, just later).
-    Within each group: random | sequential | best-history (higher score first; IPs with
-    no history are neutral and keep their random order; without any history -> random).
+    prefer_unused: IPs not seen in the ARP scan come first (used ones are kept, just later).
+    Within each group: random | sequential | best-history.
+    best-history ranks by score (history, hour-of-day weighted; unknown = neutral), minus a penalty
+    for IPs that are often seen in use, plus a small bonus for untested IPs next to good ones
+    (hunt.explore_near_good). Without any history it is plain random.
+    `skip` (recently failed IPs) are moved to the very end, so they are only reached when there
+    are not enough other candidates.
     """
     order = order or cfg.hunt.order
     rng = rng or random.Random()
+    scores = scores or {}
+    busy = busy or {}
+    skip = skip or {}
+
+    good = [_ip_key(ip) for ip, sc in scores.items() if sc >= GOOD_SCORE]
+
+    def rank(ip: str) -> float:
+        value = scores.get(ip, NEUTRAL_SCORE)
+        if cfg.hunt.explore_near_good and ip not in scores and any(abs(_ip_key(ip) - g) <= NEAR_RADIUS for g in good):
+            value += NEAR_BONUS
+        return value - BUSY_PENALTY * busy.get(ip, 0.0)
 
     def arrange(group: list[str]) -> list[str]:
         if order == "sequential":
             return sorted(group, key=_ip_key)
         shuffled = group[:]
         rng.shuffle(shuffled)
-        if order == "best-history" and scores:
-            return sorted(shuffled, key=lambda ip: -scores.get(ip, NEUTRAL_SCORE))
+        if order == "best-history" and (scores or busy):
+            return sorted(shuffled, key=lambda ip: -rank(ip))
         return shuffled
 
-    ips = cfg.ips
+    ips = [ip for ip in cfg.ips if ip not in skip]
+    cooling = [ip for ip in cfg.ips if ip in skip]
     if cfg.network.prefer_unused:
-        return arrange([i for i in ips if i not in used]) + arrange([i for i in ips if i in used])
-    return arrange(list(ips))
+        ordered = arrange([i for i in ips if i not in used]) + arrange([i for i in ips if i in used])
+    else:
+        ordered = arrange(ips)
+    # the ones with the shortest cooldown left come first among the skipped
+    return ordered + sorted(cooling, key=lambda ip: skip[ip])

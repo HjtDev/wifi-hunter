@@ -35,13 +35,43 @@ class Rec(hunter.HuntObserver):
     def finalized(self, f): self.final = f
 
 
+class FakeTime:
+    """sleep() advances a fake clock, so waiting loops finish instantly."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.slept = []
+
+    def sleep(self, s):
+        self.slept.append(s)
+        self.now += s
+
+    def clock(self):
+        return self.now
+
+
+FT = FakeTime()
+
+
 @pytest.fixture
 def env(cfg, monkeypatch):
     """Stub every side effect; record applier calls."""
-    log = {"apply": [], "dns": [], "restore": 0, "tested": [], "saved": []}
-    cfg = replace(cfg, hunt=replace(cfg.hunt, max_candidates=5, order="sequential"))
+    FT.now, FT.slept = 0.0, []
+    log = {"apply": [], "dns": [], "restore": 0, "tested": [], "saved": [], "persist": [], "mode": "reconnect",
+           "gateway": True, "gw_args": []}
+    cfg = replace(cfg, hunt=replace(cfg.hunt, max_candidates=5, order="sequential", triage_batch=0))
     monkeypatch.setattr(applier, "begin_change", lambda i, c, dry_run=False, notify=None: applier.Target("Dorm", "wlan0"))
-    monkeypatch.setattr(applier, "apply_static", lambda ip, prefix, gw, dns, *, connection, dry_run=False: log["apply"].append((ip, tuple(dns))))
+    def switch(ip, prefix, gw, dns, *, target, live, dry_run=False, sleep=None, clock=None):
+        log["apply"].append((ip, tuple(dns)))
+        log.setdefault("live_flags", []).append(live)
+        mode = log["mode"] if live else "reconnect"
+        if live and log["mode"] == "reconnect":
+            return applier.SwitchResult("reconnect", "live IP switching is not working here (test)")
+        return applier.SwitchResult(mode)
+
+    monkeypatch.setattr(applier, "switch_static", switch)
+    monkeypatch.setattr(applier, "persist_static", lambda ip, prefix, gw, dns, *, connection, dry_run=False: log["persist"].append(ip))
+    monkeypatch.setattr(nt, "ping", lambda t, n, wait=2: (20.0, 0.0 if log["gateway"] else 100.0, 1.0))
     monkeypatch.setattr(applier, "set_dns", lambda dns, *, connection, dry_run=False: log["dns"].append(tuple(dns)))
     monkeypatch.setattr(applier, "restore", lambda dry_run=False: log.__setitem__("restore", log["restore"] + 1) or "Dorm")
     monkeypatch.setattr(scanner, "scan_used", lambda cfg, iface=None, dry_run=False: set())
@@ -52,6 +82,8 @@ def env(cfg, monkeypatch):
     def set_tests(fn):
         def run_all(c, ip, mode, deep=True, **kw):
             log["tested"].append(ip)
+            log["gw_args"].append(kw.get("gateway_ok"))
+            log.setdefault("deeps", []).append(deep)
             return fn(ip)
         monkeypatch.setattr(nt, "run_all", run_all)
 
@@ -59,7 +91,7 @@ def env(cfg, monkeypatch):
     return log
 
 
-NOSLEEP = dict(sleep=lambda s: None)
+NOSLEEP = dict(sleep=FT.sleep, clock=FT.clock)
 
 
 def test_stops_at_first_pass_and_keeps_ip(env):
@@ -162,10 +194,10 @@ def test_unexpected_error_restores(env):
 
 
 def test_three_apply_failures_abort_and_restore(env, monkeypatch):
-    def bad(ip, prefix, gw, dns, *, connection, dry_run=False):
+    def bad(ip, prefix, gw, dns, *, target, live, dry_run=False, sleep=None, clock=None):
         raise NetError("activation failed")
 
-    monkeypatch.setattr(applier, "apply_static", bad)
+    monkeypatch.setattr(applier, "switch_static", bad)
     env["set_tests"](lambda ip: result(ip))
     obs = Rec()
     with pytest.raises(NetError, match="consecutive"):
@@ -174,18 +206,29 @@ def test_three_apply_failures_abort_and_restore(env, monkeypatch):
     assert [e for e in obs.events if e[0] == "skipped"].__len__() == 3
 
 
-def test_gateway_unreachable_gets_one_retry(env):
-    calls = {}
+def test_dead_ip_is_recorded_without_running_the_tests(env, monkeypatch):
+    env["gateway"] = False
+    monkeypatch.setattr(nt, "run_all", lambda c, ip, mode, deep=True, **kw: (env["tested"].append(ip), env["gw_args"].append(kw["gateway_ok"]), result(ip, reason="gateway unreachable"))[2])
+    assert hunter.hunt(env["cfg"], **NOSLEEP) is None
+    assert env["gw_args"] == [False] * 5 and env["restore"] == 1  # run_all told: gateway is down, skip pinging again
 
-    def fn(ip):
-        calls[ip] = calls.get(ip, 0) + 1
-        if calls[ip] == 1:
-            return result(ip, reason="gateway unreachable")
-        return result(ip, passed=True)
 
-    env["set_tests"](fn)
-    r = hunter.hunt(env["cfg"], **NOSLEEP)
-    assert r.ip == "172.18.40.1" and calls["172.18.40.1"] == 2
+def test_readiness_wait_is_polled_not_fixed(env):
+    env["set_tests"](lambda ip: result(ip, passed=True))
+    hunter.hunt(env["cfg"], **NOSLEEP)
+    assert FT.slept == []  # gateway answered at once: no waiting at all
+    assert env["gw_args"] == [True]
+
+
+def test_reconnect_waits_longer_than_live(env, monkeypatch):
+    env["gateway"] = False
+    env["set_tests"](lambda ip: result(ip))
+    hunter.hunt(replace(env["cfg"], hunt=replace(env["cfg"].hunt, max_candidates=1, live_change="off")), **NOSLEEP)
+    reconnect_wait = FT.now
+    FT.now, FT.slept = 0.0, []
+    env["mode"] = "live"
+    hunter.hunt(replace(env["cfg"], hunt=replace(env["cfg"].hunt, max_candidates=1)), **NOSLEEP)
+    assert reconnect_wait >= 8.0 and FT.now < reconnect_wait
 
 
 def test_dry_run_changes_nothing(env, monkeypatch, capsys):
@@ -195,11 +238,69 @@ def test_dry_run_changes_nothing(env, monkeypatch, capsys):
     assert len(env["apply"]) == hunter.DRY_RUN_CANDIDATES
 
 
-def test_settle_sleep_used(env):
-    slept = []
+# ---- live IP switching
+def test_live_switching_used_and_winner_persisted(env):
+    env["mode"] = "live"
+    env["set_tests"](lambda ip: result(ip, passed=(ip == "172.18.40.2")))
+    obs = Rec()
+    r = hunter.hunt(env["cfg"], observer=obs, **NOSLEEP)
+    assert r.ip == "172.18.40.2" and env["live_flags"] == [True, True]
+    assert env["persist"] == ["172.18.40.2"]  # only the winner is written to the saved profile
+    assert any("Live IP switching works" in e[1] for e in obs.events if e[0] == "note")
+
+
+def test_live_failure_falls_back_for_the_rest_of_the_run(env):
+    env["mode"] = "reconnect"  # live attempt reports "not working"
+    env["set_tests"](lambda ip: result(ip))
+    obs = Rec()
+    hunter.hunt(env["cfg"], observer=obs, **NOSLEEP)
+    assert env["live_flags"] == [True, False, False, False, False]  # tried once, then never again
+    assert sum("not working here" in e[1] for e in obs.events if e[0] == "note") == 1
+    assert env["persist"] == []
+
+
+def test_live_change_off_never_tries_live(env):
+    env["mode"] = "live"
     env["set_tests"](lambda ip: result(ip, passed=True))
-    hunter.hunt(env["cfg"], sleep=slept.append)
-    assert slept[0] == env["cfg"].hunt.settle_seconds
+    hunter.hunt(replace(env["cfg"], hunt=replace(env["cfg"].hunt, live_change="off")), **NOSLEEP)
+    assert env["live_flags"] == [False] and env["persist"] == []
+
+
+def test_reconnect_winner_is_not_persisted_again(env):
+    env["set_tests"](lambda ip: result(ip, passed=True))
+    hunter.hunt(env["cfg"], **NOSLEEP)
+    assert env["persist"] == []  # the reconnect path already saved the profile
+
+
+# ---- smart ordering inputs
+def test_recently_failed_ips_are_skipped_and_reported(env):
+    from dorm_ip.db import Ranking
+
+    env["set_tests"](lambda ip: result(ip))
+    obs = Rec()
+    rk = Ranking(skip={"172.18.40.1": 10.0, "172.18.40.2": 5.0})
+    hunter.hunt(env["cfg"], observer=obs, ranking=rk, **NOSLEEP)
+    assert "172.18.40.1" not in env["tested"] and "172.18.40.2" not in env["tested"]
+    assert any("Skipping 2 recently failed" in e[1] for e in obs.events if e[0] == "note")
+
+
+def test_skipped_ips_are_used_when_nothing_else_is_left(env):
+    from dorm_ip.db import Ranking
+
+    env["set_tests"](lambda ip: result(ip))
+    cfg = replace(env["cfg"], hunt=replace(env["cfg"].hunt, max_candidates=30))
+    rk = Ranking(skip={ip: 10.0 for ip in cfg.ips})
+    obs = Rec()
+    hunter.hunt(cfg, observer=obs, ranking=rk, **NOSLEEP)
+    assert len(env["tested"]) == 20 and any("Not enough other candidates" in e[1] for e in obs.events if e[0] == "note")
+
+
+def test_scans_are_reported_to_the_history_hook(env, monkeypatch):
+    monkeypatch.setattr(scanner, "scan_used", lambda cfg, iface=None, dry_run=False: {"172.18.40.9"})
+    env["set_tests"](lambda ip: result(ip, passed=True))
+    seen = []
+    hunter.hunt(env["cfg"], on_scan=seen.append, **NOSLEEP)
+    assert seen == [{"172.18.40.9"}]
 
 
 # ---- finalize (DNS override / portal logic)
@@ -334,3 +435,199 @@ def test_settle_portal_without_login_reports_url(env, monkeypatch):
     assert "not enabled" in st.detail
     st2 = hunter.settle_portal(portal_cfg(env), "1.2.3.4", "aa", login=False, sleep=lambda s: None)
     assert "skipped" in st2.detail
+
+
+# ---- parallel triage, --find, standby, failover (phase 2)
+from dorm_ip import triage  # noqa: E402
+from dorm_ip.models import NetProfile  # noqa: E402
+
+CONTROL = "172.18.40.200"
+
+
+@pytest.fixture
+def tenv(env, monkeypatch):
+    env["cfg"] = replace(env["cfg"], hunt=replace(env["cfg"].hunt, max_candidates=8, triage_batch=4))
+    env["mode"] = "live"
+    env.update(many=[], tri_fail={}, control_ok=True, many_mode="live", batches=[])
+    monkeypatch.setattr(
+        netinfo, "get_profile",
+        lambda i, c: NetProfile("wlan0", "Dorm", "auto", CONTROL, 21, "172.18.47.254", ["172.18.32.1"], "aa:bb"),
+    )
+
+    def many(ips, prefix, gw, dns, *, target, sleep=None, clock=None):
+        env["many"].append(list(ips))
+        return applier.SwitchResult(env["many_mode"], "" if env["many_mode"] == "live" else "extra addresses did not appear")
+
+    def run_triage(cfg, ips, *, control=None, login=None):
+        env["batches"].append(list(ips))
+        res = {ip: triage.TriageResult(ip, ip not in env["tri_fail"], env["tri_fail"].get(ip), gateway_ok=True) for ip in ips}
+        return res, (triage.TriageResult(control, env["control_ok"]) if control else None)
+
+    monkeypatch.setattr(applier, "switch_many", many)
+    monkeypatch.setattr(triage, "run_triage", run_triage)
+    return env
+
+
+def ip(n):
+    return f"172.18.40.{n}"
+
+
+def test_triage_filters_and_only_survivors_get_the_full_test(tenv):
+    tenv["tri_fail"] = {ip(1): "gateway unreachable", ip(2): "packet loss 40%", ip(3): "no internet: x"}
+    tenv["set_tests"](lambda i: result(i, passed=True))
+    saved = []
+    r = hunter.hunt(tenv["cfg"], save=saved.append, **NOSLEEP)
+    assert r.ip == ip(4) and tenv["tested"] == [ip(4)]
+    assert tenv["many"] == [[CONTROL, ip(1), ip(2), ip(3), ip(4)]]  # own IP stays on as the control
+    assert [(x.ip, x.fail_reason) for x in saved[:3]] == [
+        (ip(1), "gateway unreachable"), (ip(2), "packet loss 40%"), (ip(3), "no internet: x")]  # failures reach the history
+    assert tenv["persist"] == [ip(4)] and tenv["restore"] == 0
+
+
+def test_survivors_are_tested_one_at_a_time_and_batches_follow(tenv):
+    tenv["tri_fail"] = {ip(i): "x" for i in range(1, 5)}  # the whole first batch dies in triage
+    tenv["set_tests"](lambda i: result(i, passed=(i == ip(6))))
+    r = hunter.hunt(tenv["cfg"], **NOSLEEP)
+    assert r.ip == ip(6) and tenv["batches"] == [[ip(i) for i in range(1, 5)], [ip(i) for i in range(5, 9)]]
+    assert tenv["tested"] == [ip(5), ip(6)]
+
+
+def test_batch_size_comes_from_the_config(tenv):
+    tenv["cfg"] = replace(tenv["cfg"], hunt=replace(tenv["cfg"].hunt, triage_batch=3))
+    tenv["set_tests"](lambda i: result(i))
+    hunter.hunt(tenv["cfg"], **NOSLEEP)
+    assert [len(b) for b in tenv["batches"]] == [3, 3, 2]
+
+
+def test_nothing_passing_restores_the_profile(tenv):
+    tenv["set_tests"](lambda i: result(i))
+    assert hunter.hunt(tenv["cfg"], **NOSLEEP) is None and tenv["restore"] == 1
+
+
+def test_control_ip_failing_disables_triage_and_requeues_the_batch(tenv):
+    tenv["control_ok"] = False
+    tenv["set_tests"](lambda i: result(i, passed=(i == ip(2))))
+    obs = Rec()
+    r = hunter.hunt(tenv["cfg"], observer=obs, **NOSLEEP)
+    assert r.ip == ip(2) and tenv["tested"] == [ip(1), ip(2)]  # tested one by one, nothing was lost
+    assert len(tenv["batches"]) == 1  # no second batch after giving up
+    assert any("does not work here" in e[1] and "secondary address" in e[1] for e in obs.events if e[0] == "note")
+
+
+def test_all_extra_addresses_dead_without_a_control_disables_triage(tenv, monkeypatch):
+    monkeypatch.setattr(netinfo, "get_profile", lambda i, c: (_ for _ in ()).throw(netinfo.NetError("no wifi")))
+    tenv["tri_fail"] = {ip(i): "gateway unreachable" for i in range(1, 5)}
+    tenv["set_tests"](lambda i: result(i, passed=True))
+    obs = Rec()
+    r = hunter.hunt(tenv["cfg"], observer=obs, **NOSLEEP)
+    assert r.ip == ip(1) and tenv["tested"] == [ip(1)]
+    assert tenv["many"][0][0] == ip(1)  # no control: the first candidate is the primary address
+    assert any("not one of the extra addresses" in e[1] for e in obs.events if e[0] == "note")
+
+
+def test_unsupported_multi_address_falls_back_to_serial(tenv):
+    tenv["many_mode"] = "unsupported"
+    tenv["set_tests"](lambda i: result(i, passed=(i == ip(3))))
+    obs = Rec()
+    r = hunter.hunt(tenv["cfg"], observer=obs, **NOSLEEP)
+    assert r.ip == ip(3) and tenv["tested"] == [ip(1), ip(2), ip(3)] and len(tenv["many"]) == 1
+    assert any("testing one by one" in e[1] for e in obs.events if e[0] == "note")
+
+
+def test_triage_is_off_without_live_switching(tenv):
+    tenv["cfg"] = replace(tenv["cfg"], hunt=replace(tenv["cfg"].hunt, live_change="off"))
+    tenv["set_tests"](lambda i: result(i, passed=True))
+    hunter.hunt(tenv["cfg"], **NOSLEEP)
+    assert tenv["many"] == [] and tenv["tested"] == [ip(1)]
+
+
+def test_triage_is_off_with_batch_0_or_1_and_in_dry_run(tenv):
+    for batch in (0, 1):
+        tenv["many"].clear()
+        tenv["set_tests"](lambda i: result(i, passed=True))
+        hunter.hunt(replace(tenv["cfg"], hunt=replace(tenv["cfg"].hunt, triage_batch=batch)), **NOSLEEP)
+        assert tenv["many"] == []
+    hunter.hunt(tenv["cfg"], dry_run=True, **NOSLEEP)
+    assert tenv["many"] == []
+
+
+def scored(scores):
+    def fn(i):
+        r = result(i, passed=i in scores)
+        if i in scores:
+            r.score = scores[i]
+        return r
+    return fn
+
+
+def test_find_collects_n_keeps_the_best_and_sends_the_rest_to_standby(tenv):
+    tenv["set_tests"](scored({ip(1): 90.0, ip(2): 70.0, ip(3): 80.0}))
+    standby = []
+    obs = Rec()
+    r = hunter.hunt(tenv["cfg"], find=2, on_standby=standby.extend, observer=obs, **NOSLEEP)
+    assert r.ip == ip(1) and tenv["tested"] == [ip(1), ip(2)]  # stops after 2 passing IPs
+    assert [w.ip for w in standby] == [ip(2)]
+    assert tenv["persist"] == [ip(1)] and tenv["apply"][-1][0] == ip(1)  # switched back to the best
+    assert any("2 of 2 requested" in e[1] for e in obs.events if e[0] == "note")
+
+
+def test_find_switches_back_to_an_earlier_better_ip(tenv):
+    tenv["set_tests"](scored({ip(1): 95.0, ip(2): 60.0}))
+    r = hunter.hunt(tenv["cfg"], find=2, **NOSLEEP)
+    assert r.ip == ip(1) and tenv["apply"][-1][0] == ip(1) and tenv["persist"] == [ip(1)]
+
+
+def test_find_keeps_the_last_ip_without_switching_when_it_is_the_best(tenv):
+    tenv["set_tests"](scored({ip(1): 60.0, ip(2): 95.0}))
+    r = hunter.hunt(tenv["cfg"], find=2, **NOSLEEP)
+    assert r.ip == ip(2) and tenv["persist"] == [ip(2)]
+    assert [a[0] for a in tenv["apply"]].count(ip(2)) == 1  # no needless switch
+
+
+def test_find_returns_what_it_has_when_fewer_pass(tenv):
+    tenv["set_tests"](scored({ip(5): 75.0}))
+    standby = []
+    r = hunter.hunt(tenv["cfg"], find=3, on_standby=standby.extend, **NOSLEEP)
+    assert r.ip == ip(5) and standby == [] and len(tenv["tested"]) == 8  # it looked at every candidate
+
+
+def test_find_comes_from_the_config_by_default(tenv):
+    tenv["cfg"] = replace(tenv["cfg"], hunt=replace(tenv["cfg"].hunt, find=2))
+    tenv["set_tests"](scored({ip(1): 80.0, ip(2): 85.0}))
+    r = hunter.hunt(tenv["cfg"], **NOSLEEP)
+    assert r.ip == ip(2) and tenv["tested"] == [ip(1), ip(2)]
+
+
+def test_login_in_triage_uses_each_ips_own_address(tenv, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(hunter, "_login", lambda c, i, mac="": seen.setdefault("ips", []).append(i) or (True, "ok"))
+    monkeypatch.setattr(triage, "run_triage", lambda cfg, ips, *, control=None, login=None: (
+        {i: triage.TriageResult(i, bool(login(i)), gateway_ok=True) for i in ips}, None))
+    tenv["set_tests"](lambda i: result(i, passed=True))
+    cfg = portal_cfg(tenv)
+    cfg = replace(cfg, hunt=replace(cfg.hunt, triage_batch=2, max_candidates=2))
+    hunter.hunt(cfg, **NOSLEEP)
+    assert seen["ips"][:2] == [ip(1), ip(2)]
+
+
+# ---- failover to a standby IP
+def test_failover_uses_the_first_standby_that_still_passes(env):
+    env["mode"] = "live"
+    env["set_tests"](lambda i: result(i, passed=(i == ip(8))))
+    saved, dropped = [], []
+    r = hunter.failover(env["cfg"], [ip(7), ip(8), ip(9)], save=saved.append, drop=dropped.append, **NOSLEEP)
+    assert r.ip == ip(8) and dropped == [ip(7)] and [x.ip for x in saved] == [ip(7), ip(8)]
+    assert env["deeps"] == [False, False]  # a quick re-check, not a full hunt
+    assert env["persist"] == [ip(8)]
+
+
+def test_failover_gives_up_after_three_tries(env):
+    env["set_tests"](lambda i: result(i))
+    dropped = []
+    assert hunter.failover(env["cfg"], [ip(i) for i in range(1, 8)], drop=dropped.append, **NOSLEEP) is None
+    assert dropped == [ip(1), ip(2), ip(3)]
+
+
+def test_failover_with_nothing_to_try(env):
+    env["set_tests"](lambda i: result(i, passed=True))
+    assert hunter.failover(env["cfg"], [], **NOSLEEP) is None

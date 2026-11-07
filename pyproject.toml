@@ -4,16 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dorm-ip"
-version = "0.4.0"
+version = "0.9.1"
 description = "Find and keep a fast, stable static IP on a captive-portal dorm wifi"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "typer>=0.12",
-    "rich>=13",
-    "httpx>=0.27",
-    "click",
-]
+dependencies = ["typer>=0.12", "rich>=13", "httpx>=0.27"]
 
 [project.optional-dependencies]
 keyring = ["keyring>=24"]

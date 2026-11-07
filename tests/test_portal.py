@@ -163,7 +163,7 @@ def test_login_uses_dorm_dns_for_the_portal_host(creds, monkeypatch):
     seen = {}
     monkeypatch.setattr(
         portal.httpx, "HTTPTransport",
-        lambda verify=True: httpx.MockTransport(lambda r: seen.update(url=str(r.url), host=r.headers["host"]) or httpx.Response(200, text="ok")),
+        lambda verify=True, local_address=None: httpx.MockTransport(lambda r: seen.update(url=str(r.url), host=r.headers["host"]) or httpx.Response(200, text="ok")),
     )
     ok, _ = portal.login_detail(pcfg(creds, url="http://portal.dorm.local/login"), dorm_dns=["172.18.32.1"])
     assert ok and asked == [(["172.18.32.1"], "portal.dorm.local")]
@@ -175,9 +175,23 @@ def test_host_ip_overrides_dns_and_dns_can_be_disabled(creds, monkeypatch):
     seen = {}
     monkeypatch.setattr(
         portal.httpx, "HTTPTransport",
-        lambda verify=True: httpx.MockTransport(lambda r: seen.update(url=str(r.url)) or httpx.Response(200)),
+        lambda verify=True, local_address=None: httpx.MockTransport(lambda r: seen.update(url=str(r.url)) or httpx.Response(200)),
     )
     portal.login_detail(pcfg(creds, url="http://portal.dorm.local/x", host_ip="10.9.9.9"), dorm_dns=["172.18.32.1"])
     assert seen["url"] == "http://10.9.9.9/x"
     portal.login_detail(pcfg(creds, url="http://portal.dorm.local/x", resolve_via_dorm_dns=False), dorm_dns=["172.18.32.1"])
     assert seen["url"] == "http://portal.dorm.local/x"
+
+
+def test_login_is_sent_from_the_given_source_address(creds, monkeypatch):
+    seen = {}
+
+    def transport(verify=True, local_address=None):
+        seen["local"] = local_address
+        return httpx.MockTransport(lambda r: httpx.Response(200))
+
+    monkeypatch.setattr(portal.httpx, "HTTPTransport", transport)
+    assert portal.login_detail(pcfg(creds, url="http://10.0.0.1/x"), source_ip="172.18.40.9")[0]
+    assert seen["local"] == "172.18.40.9"
+    portal.login_detail(pcfg(creds, url="http://10.0.0.1/x"))
+    assert seen["local"] is None

@@ -68,7 +68,12 @@ class ThresholdsCfg:
 class HuntCfg:
     max_candidates: int = 30
     order: str = "random"  # random | sequential | best-history
-    settle_seconds: float = 4
+    settle_seconds: float = 4  # max wait for the gateway after a live IP switch (a reconnect waits longer)
+    live_change: str = "auto"  # auto: switch the IP without reconnecting (verified, falls back) | off
+    skip_failed_minutes: float = 30  # cooldown after a failed test, doubling per failure; 0 = never skip
+    explore_near_good: bool = True  # best-history: small bonus for untested IPs next to known-good ones
+    triage_batch: int = 12  # candidates filtered in parallel before the full serial tests (0/1 = one by one)
+    find: int = 1  # how many IPs must pass the full test (the best is kept, the rest go to standby)
 
 
 @dataclass
@@ -87,10 +92,19 @@ class WatchdogCfg:
 
 
 @dataclass
+class StandbyCfg:
+    max_age_hours: float = 12  # standby IPs older than this are forgotten
+    failover: bool = True  # the watchdog tries standby IPs before running a full hunt
+
+
+@dataclass
 class PortalCfg:
     """Captive-portal auto-login. Credentials never live here (see credentials_file)."""
 
     enabled: bool = False
+    # "flow": do what a browser does (follow the portal's own redirect to its login page, load it, submit its form,
+    # then check that the internet is really open). Needs no pasted request. "replay": send the request in `url`/`fields`.
+    mode: str = "replay"
     url: str = ""
     method: str = "POST"  # GET | POST
     content_type: str = "form"  # form | json (POST body encoding)
@@ -106,7 +120,12 @@ class PortalCfg:
     # Resolve the portal host through the dorm DNS (dns.default) even while the system DNS is the
     # override: the portal name usually only exists in the dorm DNS.
     resolve_via_dorm_dns: bool = True
-    host_ip: str = ""  # optional fixed IP for the portal host (skips DNS)
+    host_ip: str = ""
+    # flow mode, only needed when the login page has no parsable <form> (e.g. it is built by JavaScript):
+    form_username_field: str = ""  # name of the username input (auto-detected from the form when empty)
+    form_password_field: str = ""
+    post_path: str = ""  # where the login form is submitted, e.g. "/internal/dologin.php"
+    post_drop_params: list[str] = field(default_factory=lambda: ["reason"])  # query parameters not to carry over  # optional fixed IP for the portal host (skips DNS)
     verify_tls: bool = True
     timeout: float = 10
 
@@ -120,6 +139,7 @@ class Config:
     hunt: HuntCfg
     watchdog: WatchdogCfg
     portal: PortalCfg
+    standby: StandbyCfg = field(default_factory=StandbyCfg)
     # computed by finalize():
     ips: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -203,6 +223,14 @@ def _validate(cfg: Config) -> None:
         raise ConfigError(f"config: dns.final_mode must be one of {sorted(_VALID_FINAL)}")
     if cfg.thresholds.speed_rule not in ("both", "either"):
         raise ConfigError("config: thresholds.speed_rule must be 'both' or 'either'")
+    if cfg.hunt.live_change not in ("auto", "off"):
+        raise ConfigError("config: hunt.live_change must be 'auto' or 'off'")
+    if cfg.hunt.triage_batch < 0 or cfg.hunt.triage_batch > 40:
+        raise ConfigError("config: hunt.triage_batch must be between 0 and 40")
+    if cfg.hunt.find < 1:
+        raise ConfigError("config: hunt.find must be at least 1")
+    if cfg.hunt.skip_failed_minutes < 0:
+        raise ConfigError("config: hunt.skip_failed_minutes must not be negative")
     if cfg.hunt.order not in _VALID_ORDER:
         raise ConfigError(f"config: hunt.order must be one of {sorted(_VALID_ORDER)}")
     if not n.ranges:
@@ -212,8 +240,10 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("config: portal.method must be GET or POST")
     if p.content_type not in ("form", "json"):
         raise ConfigError("config: portal.content_type must be 'form' or 'json'")
-    if p.enabled and not p.url:
-        raise ConfigError("config: portal.enabled is true but portal.url is empty")
+    if p.mode not in ("replay", "flow"):
+        raise ConfigError("config: portal.mode must be 'replay' or 'flow'")
+    if p.enabled and p.mode == "replay" and not p.url:
+        raise ConfigError("config: portal.enabled is true but portal.url is empty (or use portal.mode = \"flow\")")
 
 
 def finalize(cfg: Config) -> Config:
@@ -275,7 +305,7 @@ def load_config(path: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{p}: invalid TOML: {e}") from None
 
-    known = {"network", "dns", "tests", "thresholds", "hunt", "watchdog", "portal"}
+    known = {"network", "dns", "tests", "thresholds", "hunt", "watchdog", "portal", "standby"}
     unknown = set(raw) - known
     if unknown:
         raise ConfigError(f"config: unknown section(s): {', '.join(sorted(unknown))}")
@@ -291,6 +321,7 @@ def load_config(path: Path | None = None) -> Config:
         hunt=_build(HuntCfg, raw.get("hunt", {}), "hunt"),
         watchdog=_build(WatchdogCfg, raw.get("watchdog", {}), "watchdog"),
         portal=_build(PortalCfg, raw.get("portal", {}), "portal"),
+        standby=_build(StandbyCfg, raw.get("standby", {}), "standby"),
         source=p,
     )
     return finalize(cfg)
@@ -304,6 +335,8 @@ def with_overrides(
         prefix: int | None = None,
         max_candidates: int | None = None,
         order: str | None = None,
+        find: int | None = None,
+        triage_batch: int | None = None,
 ) -> Config:
     """Apply per-run CLI overrides and re-expand/validate."""
     hunt = cfg.hunt
@@ -311,6 +344,10 @@ def with_overrides(
         hunt = replace(hunt, max_candidates=max_candidates)
     if order is not None:
         hunt = replace(hunt, order=order)
+    if find is not None:
+        hunt = replace(hunt, find=find)
+    if triage_batch is not None:
+        hunt = replace(hunt, triage_batch=triage_batch)
     cfg = replace(cfg, hunt=hunt)
     net = cfg.network
     if ranges is not None:

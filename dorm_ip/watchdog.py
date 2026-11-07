@@ -124,6 +124,7 @@ class Watchdog:
             *,
             db,  # dorm_ip.db.DB (save, save_check, daily_bytes)
             hunt: Callable[[], TestResult | None],
+            failover: Callable[[], TestResult | None] | None = None,
             observer: WatchObserver | None = None,
             notify: Callable[[str], None] | None = None,
             sleep: Callable[[float], None] = time.sleep,
@@ -133,6 +134,7 @@ class Watchdog:
         self.cfg = cfg
         self.db = db
         self.hunt = hunt
+        self.failover = failover
         self.obs = observer or WatchObserver()
         self.notify = notify or (send_notification if cfg.watchdog.notify else (lambda _m: None))
         self.sleep = sleep
@@ -300,13 +302,23 @@ class Watchdog:
             self.hold_until = now + self.cfg.watchdog.rehunt_cooldown_seconds
             return
 
-        self.rehunts += 1
-        self.obs.note("Re-hunting for a better IP")
-        try:
-            result = self.hunt()
-        except NetError as e:
-            result = None
-            self.obs.note(f"Re-hunt error: {e}")
+        result = None
+        if self.failover is not None:  # a pre-qualified standby IP is much cheaper than a hunt
+            self.obs.note("Trying standby IPs first")
+            try:
+                result = self.failover()
+            except NetError as e:
+                self.obs.note(f"Standby failover error: {e}")
+            if result is not None:
+                self.obs.note(f"Switched to standby IP {result.ip}")
+        if result is None:
+            self.rehunts += 1
+            self.obs.note("Re-hunting for a better IP")
+            try:
+                result = self.hunt()
+            except NetError as e:
+                result = None
+                self.obs.note(f"Re-hunt error: {e}")
 
         if result is not None:
             self.hunt_failures = 0
