@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.9.1] - 2026-11-04
+
+### Added
+- **Flow-mode portal login** (`portal.mode = "flow"`, now the default for new setups): follows the portal's own redirect to its
+  login page, loads it for the session cookies, submits its form from the right source address and then verifies that the
+  internet really opened. Nothing is pasted or goes stale per IP. Recognises Kerio Control portals whose login page has no
+  parsable form (`/internal/dologin.php`, `kerio_username` / `kerio_password`); other portals can set `post_path` and the field names.
+- `dorm-ip login --debug`: a step-by-step trace (redirects, cookies by name, form fields, result) with no secrets in it.
+- Portal and `.local` names are resolved through the dorm DNS (system resolvers often send `.local` to mDNS only).
+- `dorm-ip init` asks how to log in (`flow` or `replay`).
+
+### Fixed
+- Auto-login failed on portals that put per-client values in the login URL (here: a base64 token containing the client IP),
+  need the session cookies from the login page, or answer `302` whether the login worked or not. The old replay import froze
+  the token, dropped the cookies and trusted the response code.
+
 ## [0.9.0] - 2026-11-02
 
 ### Added

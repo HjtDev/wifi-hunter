@@ -192,3 +192,23 @@ Decisions made where the spec was ambiguous (simplest option chosen).
 - `tests/test_readme.py` fails if a command, option or config key is missing from the README, if the version differs between
   `pyproject.toml`, `dorm_ip/__init__.py` and the README/CHANGELOG, or if the CI workflow / Makefile docs go missing.
 - Version 0.9.0; `dorm-ip --version` added.
+
+## 0.9.1: portal flow login
+- Diagnosis from a real Kerio Control HAR: the login URL carries `dest` (base64 of the page asked for) and `host` (base64 of
+  "<client ip> <32 hex>": a per-client token), the login page sets `SESSION_CONTROL_WEBIFACE` / `TOKEN_CONTROL_WEBIFACE`, the POST
+  body is only `kerio_username` + `kerio_password`, and the answer is `302` to `dest` (also a `302` back to `/login/?reason=failure`
+  on a rejected login, and the user saw a failure message although the internet was open). The POST URL is the login-page URL with
+  the path swapped to `/internal/dologin.php` and `reason` dropped. The old replay import froze `host`, dropped the cookies and
+  judged success by HTTP code, so it broke on any IP but the captured one.
+- Flow: (1) GET `connectivity_url` without following redirects -> Location is the *fresh* login URL (an already-204 answer means
+  "already open"; an HTML page with a form is used directly); (2) GET it with a cookie jar, parse `<form>`s (stdlib HTMLParser,
+  entities decoded) and pick the one with a password input, else fall back to `post_path` / the known-portal table (Kerio is
+  recognised by its `Server` header or by a `/login...` URL with `NTLM` and `dest` parameters); (3) POST the filled form with
+  Referer/Origin, follow redirects only while they stay on the portal host; (4) poll the connectivity check up to 4 times
+  (0.7 s apart): success = "open". A redirect back with `reason=failure` only changes the failure message.
+- The derived POST URL keeps the raw query string (base64 contains `+`, `/`, `=`: decoding and re-encoding would damage it).
+- Name resolution in flow mode: the portal host, `*.local`/`*.lan`/... and single-label names -> dorm DNS directly (UDP); other
+  hosts -> the system DNS, falling back to the dorm DNS if it fails; `portal.host_ip` pins the portal host.
+- `tests.check_url(url, source)` is the connectivity check for any URL (`check_portal(cfg)` uses `tests.connectivity_url`).
+- Trace lines never contain credentials (tests assert it); cookies are listed by name only.
+- Not done yet from the roadmap's 1.3: HAR import, learning/refreshing the session lifetime.

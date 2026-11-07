@@ -74,6 +74,10 @@ unit tests must pass unchanged on the Linux backend before anything else is buil
   first**, then set numeric targets from it.
 
 ### 1.3 Auto-login overhaul
+**Done in 0.9.1:** diagnostics (`login --debug`), the flow engine (follow the redirect, cookies, form parsing, Kerio fallback), verification by
+the connectivity check, and dorm-DNS resolution for `.local` portals. **Still open:** HAR import, learning and refreshing the session
+lifetime, and a Windows-friendly flow check. The original description follows.
+
 Blocked on your details (list below), so this runs in parallel with the rest of the phase. We diagnose before changing
 anything.
 
