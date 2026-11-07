@@ -102,6 +102,9 @@ class PortalCfg:
     """Captive-portal auto-login. Credentials never live here (see credentials_file)."""
 
     enabled: bool = False
+    # "flow": do what a browser does (follow the portal's own redirect to its login page, load it, submit its form,
+    # then check that the internet is really open). Needs no pasted request. "replay": send the request in `url`/`fields`.
+    mode: str = "replay"
     url: str = ""
     method: str = "POST"  # GET | POST
     content_type: str = "form"  # form | json (POST body encoding)
@@ -117,7 +120,12 @@ class PortalCfg:
     # Resolve the portal host through the dorm DNS (dns.default) even while the system DNS is the
     # override: the portal name usually only exists in the dorm DNS.
     resolve_via_dorm_dns: bool = True
-    host_ip: str = ""  # optional fixed IP for the portal host (skips DNS)
+    host_ip: str = ""
+    # flow mode, only needed when the login page has no parsable <form> (e.g. it is built by JavaScript):
+    form_username_field: str = ""  # name of the username input (auto-detected from the form when empty)
+    form_password_field: str = ""
+    post_path: str = ""  # where the login form is submitted, e.g. "/internal/dologin.php"
+    post_drop_params: list[str] = field(default_factory=lambda: ["reason"])  # query parameters not to carry over  # optional fixed IP for the portal host (skips DNS)
     verify_tls: bool = True
     timeout: float = 10
 
@@ -232,8 +240,10 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("config: portal.method must be GET or POST")
     if p.content_type not in ("form", "json"):
         raise ConfigError("config: portal.content_type must be 'form' or 'json'")
-    if p.enabled and not p.url:
-        raise ConfigError("config: portal.enabled is true but portal.url is empty")
+    if p.mode not in ("replay", "flow"):
+        raise ConfigError("config: portal.mode must be 'replay' or 'flow'")
+    if p.enabled and p.mode == "replay" and not p.url:
+        raise ConfigError("config: portal.enabled is true but portal.url is empty (or use portal.mode = \"flow\")")
 
 
 def finalize(cfg: Config) -> Config:

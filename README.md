@@ -32,8 +32,10 @@ goes bad.
 - **Daily data budget** for all test traffic; per-candidate timing in the live table.
 
 **The captive portal**
-- **Auto-login**: replays your browser's login request (import it with "Copy as cURL"); the portal host is resolved
-  through the dorm DNS even while your system DNS is the override.
+- **Auto-login that works like a browser** (`portal.mode = "flow"`): follows the portal's own redirect to its login page, loads
+  it (session cookies), submits its form and then checks that the internet really opened. Nothing to paste, nothing goes stale
+  per IP. Works with Kerio Control portals even when the page is built by JavaScript. The older "replay a pasted request" mode
+  is still available. The portal host is resolved through the dorm DNS even while your system DNS is the override.
 - Logs in during a hunt, after `dorm-ip set`, when the watchdog sees an expired session, and on demand (`dorm-ip login`).
 - **DNS override** to skip the portal's DNS redirect while testing; you choose which DNS stays afterwards.
 - Credentials live in a `chmod 600` file (or the system keyring), never in the config.
@@ -92,7 +94,8 @@ What it asks (Enter accepts the default shown; yes/no questions default to Yes):
    (and the IP ranges to hunt).
 2. **What is a good IP**: prefer unused IPs, override DNS servers, which DNS to keep, minimum speed in MB/s, whether the
    quick *or* the sustained speed is enough, maximum ping, candidates per hunt, order, daily data budget.
-3. **Portal auto-login**: username, password (hidden) and the login request (below).
+3. **Portal auto-login**: username, password (hidden) and how to log in: `flow` (recommended: nothing to paste) or `replay` (a
+   login request you paste, below).
 4. **Watchdog**: check interval and notifications.
 5. **Shell command**: offers to add `dorm-ip` to bash, zsh and fish so you can run it from any folder (see
    [Shell command](#shell-command)). Skipped with `--no-shell` or `--yes`.
@@ -100,20 +103,26 @@ What it asks (Enter accepts the default shown; yes/no questions default to Yes):
 Re-running `init` is safe: your existing values become the defaults and the old config is kept as `config.toml.bak`.
 `dorm-ip init --yes` accepts every default without asking (and never touches your shell files).
 
-### Giving it the portal login request
+### How the portal login works
 
-1. Open the portal login page in Chrome/Firefox and press **F12** > **Network**.
-2. Log in. Right-click the login request (usually a `POST`) > **Copy** > **Copy as cURL (bash)**.
-3. Paste it into the setup when asked (end with an empty line), or save it to a file and run
-   `dorm-ip init --curl-file login.curl`.
-
-The setup swaps your username/password (and IP/MAC) for the placeholders `{username}`, `{password}`, `{ip}`, `{mac}`,
-drops cookies and browser-only headers, and writes the rest to the `[portal]` section. **Your credentials never end up in
-`config.toml`.** Then check it works:
+**Flow mode (default, recommended).** `dorm-ip` does what your browser does: it asks for a normal web page, the portal answers
+with a redirect to its login page (that address carries values that are specific to your IP, so nothing is ever copied from an
+old session), it loads that page (which sets the session cookies), finds the login form, submits it with your credentials from
+the right source address, and then checks that the internet is really open. It does **not** trust the portal's reply: some
+portals answer `302` whether the login worked or not. If the page has no form that can be parsed (built by JavaScript), Kerio
+Control portals are recognised and their login endpoint is used; for other portals set `portal.post_path`,
+`portal.form_username_field` and `portal.form_password_field`. Test and inspect it with:
 
 ```bash
-dorm-ip login --force
+dorm-ip login --force --debug     # every step, redirect and form field; no secrets in the output
 ```
+
+**Replay mode.** For portals where flow mode does not fit: `portal.mode = "replay"` sends one request that you captured. Open
+the login page, press **F12** > **Network**, log in, right-click the login request > **Copy** > **Copy as cURL (bash)**, and paste
+it into `dorm-ip init` (or `dorm-ip init --curl-file login.curl`). Your username/password become `{username}`/`{password}`
+placeholders and cookies are dropped, so this only suits portals with a fixed, cookie-less login request.
+
+Either way **your credentials never end up in `config.toml`.**
 
 ## Everyday use
 
@@ -133,9 +142,9 @@ Run commands as `dorm-ip ...` once the shell command is installed, otherwise `uv
 | `dorm-ip dns override` / `dns default` / `dns set A,B` | Change only the DNS, not the IP |
 | `dorm-ip dhcp` | Back to automatic (DHCP) |
 | `dorm-ip restore` | Restore the original profile saved before the first change |
-| `dorm-ip login [--force]` | Test or trigger the portal login |
+| `dorm-ip login [--force] [--debug]` | Log in to the portal now; `--debug` shows every step of the login (no secrets) |
 | `dorm-ip live-check [--ip IP] [--compare] [--force]` | Check that switching the IP without a reconnect works here, and time it |
-| `dorm-ip init [--yes] [--curl-file F] [--no-shell]` | Guided setup |
+| `dorm-ip init [--yes] [--curl-file F] [--no-shell]` | Guided setup (`--curl-file` selects replay mode with that request) |
 | `dorm-ip shell install` / `shell uninstall` / `shell status` | Add or remove the `dorm-ip` command in your shell config (`--shell bash\|zsh\|fish\|all`) |
 | `dorm-ip path config\|credentials\|db\|backup` | Print where a file lives |
 
@@ -230,7 +239,9 @@ The dorm DNS sends every unauthenticated client to the portal, and the portal's 
 - **A candidate still shows the portal** (its IP is not logged in). `dorm-ip` logs in for you: it resolves the portal host by
   asking the **dorm DNS server directly** (a UDP query, no system change) and connects to that address while keeping the real
   host name for `Host`/TLS, always from the candidate's own address. So login works while your system DNS stays on the
-  override, with no DNS switching and no extra reconnect. (`host_ip` can pin the address by hand.)
+  override, with no DNS switching and no extra reconnect. This also works for portal names ending in `.local`, which many Linux
+  systems send to mDNS only (a browser may then fail to open the page while `dorm-ip` logs in fine). `host_ip` pins the address
+  by hand if the name cannot be resolved at all.
 - **`final_mode`** decides which DNS stays after a hunt: `override` (default), `default` (dorm DNS, then portal check) or
   `auto` (override if the portal stays open, otherwise the dorm DNS).
 
@@ -267,7 +278,7 @@ chart, how unused IPs compare with IPs seen in use, IPs on cooldown, and today's
 | Result text | Meaning |
 |---|---|
 | `gateway unreachable` | the IP did not answer from the gateway (dead, or an IP conflict) |
-| `captive portal: login required` | the portal blocks this IP and auto-login is off or failed |
+| `captive portal: login required` | the portal blocks this IP and auto-login is off or failed (`dorm-ip login --debug` shows why) |
 | `no internet: no answer within 5 s (connection timed out)` | the gateway answers but the internet path is blocked for this IP |
 | `no internet: DNS lookup failed` / `could not connect` | the network was not usable (fast errors are retried twice first) |
 | `packet loss N% > M%` | too much loss |
@@ -309,8 +320,10 @@ config. Lookup order: `--config PATH`, `~/.config/dorm-ip/config.toml`, `./confi
 | `[standby]` | `max_age_hours`, `failover` | forget standby IPs after this long; let the watchdog use them before a full hunt |
 | `[watchdog]` | `interval_seconds`, `probe_bytes`, `bad_checks_to_rehunt`, `notify` | check cadence, probe size, trigger, notifications |
 | | `min_probe_mbps`, `rehunt_cooldown_seconds`, `busy_mbps` | probe limit (slow-start aware), back-off, "link busy" threshold |
-| `[portal]` | `enabled`, `url`, `method`, `content_type`, `fields`, `query`, `headers` | the login request (`{username}` `{password}` `{ip}` `{mac}` are filled in) |
-| | `success_contains`, `failure_contains` | text that marks a successful / rejected login |
+| `[portal]` | `enabled`, `mode` | auto-login on/off; `flow` (follow the portal's login page) or `replay` (send the request below) |
+| | `url`, `method`, `content_type`, `fields`, `query`, `headers` | replay mode: the login request (`{username}` `{password}` `{ip}` `{mac}` are filled in) |
+| | `post_path`, `form_username_field`, `form_password_field`, `post_drop_params` | flow mode, only if the login page has no parsable form: where to submit and the field names; query parameters not to carry over (default `reason`) |
+| | `success_contains`, `failure_contains` | replay mode: text that marks a successful / rejected login (flow mode checks the internet instead) |
 | | `credentials_file`, `keyring_service` | where the credentials are read from |
 | | `login_during_hunt`, `max_logins_per_hunt` | log in on candidates that show the portal; cap per hunt |
 | | `resolve_via_dorm_dns`, `host_ip`, `verify_tls`, `timeout` | how the portal host is reached |
@@ -397,6 +410,10 @@ per day (200 KB every 30 s is about 580 MB; every 10 s about 1.7 GB). All of it 
 - **Candidates fail with "captive portal: login required"**: auto-login is off or failing. Run `dorm-ip login --force`; if
   it says the request was rejected, set `success_contains`/`failure_contains` or re-run `dorm-ip init` and paste the request
   again.
+- **Login fails**: run `dorm-ip login --force --debug`. It shows the redirect, the login page, the form fields and the result.
+  `no login form found` means the page is built by JavaScript: set `portal.post_path` and the two field names (Kerio Control is
+  recognised automatically). `the portal rejected the login` means the portal sent you back to the login page: check the
+  username and password. `no internet afterwards` means the login worked but the IP has no route out.
 - **Login works but the portal host does not resolve**: set `portal.host_ip` to the portal's address.
 - **"live IP switching is not working here"**: your driver or NetworkManager does not apply the change live; the hunt continues
   with reconnects. Run `dorm-ip live-check --compare` to see why, and set `hunt.live_change = "off"` to silence it.

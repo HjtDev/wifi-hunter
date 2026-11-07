@@ -63,7 +63,10 @@ def _sigterm_as_interrupt() -> Iterator[None]:
 def _login(cfg: Config, ip: str = "", mac: str = "") -> tuple[bool, str]:
     """Portal login with the portal host resolved through the dorm DNS (works under override DNS)."""
     # sent from `ip` itself: with several addresses on the interface the login must come from the right one
-    return portal.login_detail(cfg.portal, ip=ip, mac=mac, dorm_dns=cfg.dns.default, source_ip=ip or None)
+    return portal.login_detail(
+        cfg.portal, ip=ip, mac=mac, dorm_dns=cfg.dns.default, source_ip=ip or None,
+        connectivity_url=cfg.tests.connectivity_url,
+    )
 
 
 def try_login(cfg: Config, ip: str = "", mac: str = "") -> bool:
