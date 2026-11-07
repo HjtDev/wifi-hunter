@@ -59,7 +59,8 @@ rehunt_cooldown_seconds = 300         # doubles after each failed re-hunt, max 3
 busy_mbps               = 2.0         # slow probe + your own traffic above this = ignored (0 = off)
 
 [portal]
-enabled              = false          # `dorm-ip init` turns this on once it has your login request
+enabled              = false          # `dorm-ip init` turns this on once it has your credentials
+mode                 = "flow"         # flow: follow the portal's own login page | replay: send the request below
 url                  = ""
 method               = "POST"
 content_type         = "form"         # form | json
@@ -73,6 +74,10 @@ keyring_service      = ""
 login_during_hunt    = true           # log in on candidates that show the portal
 max_logins_per_hunt  = 10
 resolve_via_dorm_dns = true           # resolve the portal host through dns.default, even on override DNS
-host_ip              = ""
+host_ip              = ""             # fixed portal IP, if its name does not resolve
+form_username_field  = ""             # flow mode: only if the login page has no parsable form
+form_password_field  = ""
+post_path            = ""
+post_drop_params     = ["reason"]
 verify_tls           = true
 timeout              = 10

@@ -63,14 +63,18 @@ SCHEMA: list[tuple[str, list[tuple[str, str]]]] = [
         ("busy_mbps", "slow probe + your own traffic above this = ignored (0 = off)"),
     ]),
     ("portal", [
-        ("enabled", ""), ("url", ""), ("method", ""), ("content_type", "form | json"),
+        ("enabled", ""), ("mode", "flow: follow the portal's own login page | replay: send the request below"),
+        ("url", ""), ("method", ""), ("content_type", "form | json"),
         ("fields", "{username} {password} {ip} {mac} are filled in at login time"),
         ("query", ""), ("headers", ""), ("success_contains", ""), ("failure_contains", ""),
         ("credentials_file", "username/password live here, never in this file"),
         ("keyring_service", ""), ("login_during_hunt", "log in on candidates that show the portal"),
         ("max_logins_per_hunt", ""),
         ("resolve_via_dorm_dns", "resolve the portal host through dns.default, even on override DNS"),
-        ("host_ip", ""), ("verify_tls", ""), ("timeout", ""),
+        ("host_ip", "fixed portal IP, if its name does not resolve"),
+        ("form_username_field", "flow mode: only if the login page has no parsable form"),
+        ("form_password_field", ""), ("post_path", ""), ("post_drop_params", ""),
+        ("verify_tls", ""), ("timeout", ""),
     ]),
 ]
 
@@ -285,10 +289,13 @@ def run_init(
 ) -> InitResult | None:
     """Interactive setup. Returns None if the user declined to overwrite an existing config."""
     values = example_values()
+    raw_portal: dict = {}
     base_path = target if target.exists() else source
     if base_path is not None and base_path.exists():
         try:
-            values = merge(values, tomllib.loads(base_path.read_text()))
+            raw = tomllib.loads(base_path.read_text())
+            raw_portal = raw.get("portal", {}) if isinstance(raw.get("portal"), dict) else {}
+            values = merge(values, raw)
             p.say(f"Using the values in {base_path} as defaults.")
         except tomllib.TOMLDecodeError:
             p.say(f"! {base_path} is not valid TOML; starting from the built-in defaults.")
@@ -368,23 +375,39 @@ def run_init(
         if not username or not password:
             notes.append("No username/password given: auto-login stays off. Re-run `dorm-ip init` to set it up.")
         else:
-            section = _portal_request(p, v_portal, curl_text, username, password, det, notes)
-            if section is not None:  # {} = keep the existing request
-                v_portal.update(section)
-                v_portal["success_contains"] = p.ask(
-                    "Text that appears in a successful login response (blank = any non-error)",
-                    v_portal.get("success_contains", ""),
+            # an existing config with a pasted request keeps "replay" as the default; new setups get "flow"
+            mode_default = raw_portal.get("mode") or ("replay" if raw_portal.get("url") else "flow")
+            mode = "replay" if curl_text else p.choose(
+                "How should I log in? flow = follow the portal's own login page like a browser (recommended), "
+                "replay = send a login request I paste",
+                ["flow", "replay"], mode_default,
+            )
+            v_portal["mode"] = mode
+            if mode == "flow":
+                p.say(
+                    "Nothing to paste: I will open the portal's login page the way a browser does, fill in its form "
+                    "and check that the internet opens. Test it with `dorm-ip login --force` (add --debug to see each step)."
                 )
+                portal_ok = True
+            else:
+                section = _portal_request(p, v_portal, curl_text, username, password, det, notes)
+                if section is not None:  # {} = keep the existing request
+                    v_portal.update(section)
+                    v_portal["success_contains"] = p.ask(
+                        "Text that appears in a successful login response (blank = any non-error)",
+                        v_portal.get("success_contains", ""),
+                    )
+                    portal_ok = True
+                else:
+                    notes.append("No login request yet: auto-login stays off. Re-run `dorm-ip init` and paste it.")
+            if portal_ok:
                 v_portal["login_during_hunt"] = p.confirm(
                     "Also log in on candidate IPs that show the portal while hunting? "
                     "(creates a portal session per candidate)", True,
                 )
-                portal_ok = True
-            else:
-                notes.append("No login request yet: auto-login stays off. Re-run `dorm-ip init` and paste it.")
             write_credentials(creds_path, username, password)
             saved_creds = creds_path
-    v_portal["enabled"] = portal_ok and bool(v_portal.get("url"))
+    v_portal["enabled"] = portal_ok and (v_portal.get("mode") == "flow" or bool(v_portal.get("url")))
 
     # ---- 4. watchdog
     p.say("\n== Watchdog ==")
