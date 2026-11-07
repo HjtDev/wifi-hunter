@@ -1,3 +1,3 @@
 """dorm-ip: find a fast, stable static IP on the dorm network."""
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"

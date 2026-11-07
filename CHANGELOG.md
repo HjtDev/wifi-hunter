@@ -1,5 +1,11 @@
 # Changelog
 
+
+## [0.9.2] - 2026-11-07
+
+### Fixed
+- Missing CODEOWNERS file was causing problems in PRs.
+
 ## [0.9.1] - 2026-11-04
 
 ### Added
