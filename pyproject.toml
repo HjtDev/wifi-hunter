@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dorm-ip"
-version = "0.9.0"
+version = "0.9.1"
 description = "Find and keep a fast, stable static IP on a captive-portal dorm wifi"
 readme = "README.md"
 requires-python = ">=3.12"
